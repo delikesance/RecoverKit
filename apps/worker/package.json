@@ -1,0 +1,12 @@
+{
+  "name": "@recoverkit/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "reconcile": "tsx src/cli.ts reconcile",
+    "replay": "tsx src/cli.ts replay"
+  },
+  "dependencies": { "@recoverkit/core": "*", "@recoverkit/db": "*", "@recoverkit/services": "*" }
+}
