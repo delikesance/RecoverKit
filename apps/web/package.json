@@ -1,0 +1,34 @@
+{
+  "name": "@recoverkit/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "e2e": "playwright test"
+  },
+  "dependencies": {
+    "@fontsource-variable/onest": "^5.2.5",
+    "@recoverkit/core": "*",
+    "@recoverkit/db": "*",
+    "@recoverkit/mail": "*",
+    "@recoverkit/services": "*",
+    "@recoverkit/stripe": "*",
+    "@stripe/stripe-js": "^10.2.0",
+    "next": "^16.4.3",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "@recoverkit/testkit": "*"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.11.0",
+    "@playwright/test": "1.63.0",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "jsdom": "^26.1.0"
+  }
+}
