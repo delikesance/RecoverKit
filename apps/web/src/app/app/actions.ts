@@ -23,9 +23,11 @@ import {
   setDryRun,
   startCheckout,
   updateSettings,
+  DEFAULT_TENANT_NAME,
   type ActivationMissing,
 } from '@recoverkit/services';
 import { getDeps } from '@/server/runtime';
+import { setFlash } from '@/server/flash';
 import { requireSession } from '@/server/session';
 
 const actor = (userId: string) => `user:${userId}`;
@@ -34,6 +36,12 @@ const str = (f: FormData, k: string) => String(f.get(k) ?? '');
 function back(path: string, params: Record<string, string>): never {
   const q = new URLSearchParams(params).toString();
   redirect(q ? `${path}?${q}` : path);
+}
+
+/** Erreur affichée sur la page cible via un flash cookie court (jamais dans l'URL). */
+async function fail(path: string, message: string, draft?: { step: number; locale: 'fr' | 'en'; subject: string; body: string }, params: Record<string, string> = {}): Promise<never> {
+  await setFlash({ path, error: message, ...(draft ? { draft } : {}) });
+  back(path, params);
 }
 
 // ── Dossiers ────────────────────────────────────────────────────────────────
@@ -87,7 +95,7 @@ export async function saveSequenceAction(formData: FormData) {
     steps.push({ delayMinutes: Math.round(Number(raw) * unit), active: formData.get(`active_${i}`) === 'on' });
   }
   const r = await saveSequence(getDeps(), s.tenantId, steps, actor(s.userId));
-  if (r.status === 'invalid') back('/app/sequence', { error: r.errors.join(' ') });
+  if (r.status === 'invalid') await fail('/app/sequence', r.errors.join(' '));
   revalidatePath('/app/sequence');
   back('/app/sequence', { notice: 'saved' });
 }
@@ -95,16 +103,21 @@ export async function saveSequenceAction(formData: FormData) {
 export async function saveTemplateAction(formData: FormData) {
   const s = await requireSession();
   const locale = str(formData, 'locale') === 'en' ? 'en' : 'fr';
-  const r = await saveTemplate(getDeps(), s.tenantId, { stepIndex: Number(str(formData, 'stepIndex')), locale, subject: str(formData, 'subject'), body: str(formData, 'body') }, actor(s.userId));
-  if (r.status === 'invalid') back('/app/emails', { locale, error: r.errors.join(' ') });
-  back('/app/emails', { locale, notice: 'saved' });
+  const step = str(formData, 'stepIndex');
+  const subject = str(formData, 'subject');
+  const body = str(formData, 'body');
+  const r = await saveTemplate(getDeps(), s.tenantId, { stepIndex: Number(step), locale, subject, body }, actor(s.userId));
+  // En cas d'erreur, le texte saisi revient dans un flash cookie court (pas dans l'URL) pour ne pas être perdu.
+  if (r.status === 'invalid') await fail('/app/emails', r.errors.join(' '), { step: Number(step) || 0, locale, subject, body }, { locale, step });
+  back('/app/emails', { locale, step, notice: 'saved' });
 }
 
 export async function resetTemplateAction(formData: FormData) {
   const s = await requireSession();
   const locale = str(formData, 'locale') === 'en' ? 'en' : 'fr';
-  await resetTemplate(getDeps(), s.tenantId, Number(str(formData, 'stepIndex')), locale, actor(s.userId));
-  back('/app/emails', { locale, notice: 'reset' });
+  const step = str(formData, 'stepIndex');
+  await resetTemplate(getDeps(), s.tenantId, Number(step), locale, actor(s.userId));
+  back('/app/emails', { locale, step, notice: 'reset' });
 }
 
 export async function sendTestEmailAction(formData: FormData) {
@@ -112,7 +125,7 @@ export async function sendTestEmailAction(formData: FormData) {
   const locale = str(formData, 'locale') === 'en' ? 'en' : 'fr';
   const r = await sendTestEmail(getDeps(), s.tenantId, s.email, { stepIndex: Number(str(formData, 'stepIndex')), locale });
   const target = str(formData, 'from') === 'onboarding' ? '/app/onboarding' : '/app/emails';
-  back(target, { locale, notice: r.status === 'sent' ? 'test_sent' : 'test_limited' });
+  back(target, { locale, step: str(formData, 'stepIndex'), notice: r.status === 'sent' ? 'test_sent' : 'test_limited' });
 }
 
 // ── Réglages ────────────────────────────────────────────────────────────────
@@ -135,7 +148,7 @@ export async function updateSettingsAction(formData: FormData) {
     },
     actor(s.userId),
   );
-  if (r.status === 'invalid') back('/app/settings', { error: r.errors.join(' ') });
+  if (r.status === 'invalid') await fail('/app/settings', r.errors.join(' '));
   revalidatePath('/app', 'layout');
   back('/app/settings', { notice: 'saved' });
 }
@@ -163,6 +176,7 @@ const MISSING_LABEL: Record<ActivationMissing, string> = {
   sender_valid: 'domaine d’envoi vérifié',
   native_emails_acknowledged: 'désactivation des relances natives de Stripe',
   test_email_sent: 'email de test',
+  company_name: 'nom affiché à vos clients (remplacez « Mon entreprise »)',
 };
 
 export async function setDryRunAction(formData: FormData) {
@@ -171,8 +185,18 @@ export async function setDryRunAction(formData: FormData) {
   const r = await setDryRun(getDeps(), s.tenantId, !live, actor(s.userId));
   revalidatePath('/app', 'layout');
   const target = str(formData, 'from') === 'onboarding' ? '/app/onboarding' : '/app/settings';
-  if (r.status === 'blocked') back(target, { error: `Avant d’activer les relances : ${r.missing.map((m) => MISSING_LABEL[m]).join(', ')}.` });
+  if (r.status === 'blocked') await fail(target, `Avant d’activer les relances : ${r.missing.map((m) => MISSING_LABEL[m]).join(', ')}.`);
   back(target, { notice: live ? 'activated' : 'dry_run' });
+}
+
+export async function saveCompanyNameAction(formData: FormData) {
+  const s = await requireSession();
+  const name = str(formData, 'name').trim();
+  if (name.toLowerCase() === DEFAULT_TENANT_NAME.toLowerCase()) await fail('/app/onboarding', 'Choisissez le nom que vos clients reconnaissent : « Mon entreprise » est le nom provisoire.');
+  const r = await updateSettings(getDeps(), s.tenantId, { name }, actor(s.userId));
+  if (r.status === 'invalid') await fail('/app/onboarding', r.errors.join(' '));
+  revalidatePath('/app', 'layout');
+  back('/app/onboarding', { notice: 'saved' });
 }
 
 export async function acknowledgeNativeEmailsAction() {
@@ -197,7 +221,7 @@ export async function disconnectStripeAction() {
 export async function deleteAccountAction(formData: FormData) {
   const s = await requireSession();
   const r = await deleteTenant(getDeps(), s.tenantId, { confirmName: str(formData, 'confirmName'), actor: actor(s.userId) });
-  if (r.status !== 'deleted') back('/app/settings', { error: 'Le nom saisi ne correspond pas : le compte n’a pas été supprimé.' });
+  if (r.status !== 'deleted') await fail('/app/settings', 'Le nom saisi ne correspond pas : le compte n’a pas été supprimé.');
   (await cookies()).delete('rk_session');
   redirect('/?deleted=1');
 }
@@ -207,13 +231,13 @@ export async function deleteAccountAction(formData: FormData) {
 export async function startCheckoutAction(formData: FormData) {
   const s = await requireSession();
   const r = await startCheckout(getDeps(), s.tenantId, str(formData, 'plan'));
-  if (r.status !== 'ok') back('/app/billing', { error: 'Ce palier n’est pas disponible.' });
+  if (r.status !== 'ok') return fail('/app/billing', 'Ce palier n’est pas disponible.');
   redirect(r.url);
 }
 
 export async function openPortalAction() {
   const s = await requireSession();
   const r = await openPortal(getDeps(), s.tenantId);
-  if (r.status !== 'ok') back('/app/billing', { error: 'Aucun abonnement à gérer pour l’instant.' });
+  if (r.status !== 'ok') return fail('/app/billing', 'Aucun abonnement à gérer pour l’instant.');
   redirect(r.url);
 }

@@ -16,6 +16,9 @@ export function createRuntime(env: Record<string, string | undefined>): Runtime 
   const config = loadConfig(env);
   const pool = new pg.Pool({ connectionString: config.databaseUrl, max: 10 });
   const log = createLogger({ level: env.LOG_LEVEL ?? 'info' });
+  if (config.nodeEnv === 'production' && config.legalMissing.length > 0) {
+    log.warn({ missing: config.legalMissing }, 'mentions légales incomplètes : variables LEGAL_* manquantes');
+  }
   pool.on('error', (e) => log.error({ err: e.message }, 'erreur du pool PostgreSQL'));
 
   const deps: Deps = {

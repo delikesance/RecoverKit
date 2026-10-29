@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { Money } from '../src/money';
+import { Money, currencyDigits } from '../src/money';
 
 describe('Money', () => {
   it('refuse les montants décimaux', () => {
@@ -31,6 +31,23 @@ describe('Money', () => {
   it('formate une devise sans décimales (JPY)', () => {
     const text = Money.of(1500, 'JPY').format('fr-FR').replace(/\s/g, ' ');
     expect(text).toContain('1 500');
+  });
+
+  it('ISK/UGX : Stripe les compte en centièmes (2 décimales d’API), affichés sans décimales', () => {
+    const isk = Money.of(100000, 'ISK').format('fr-FR').replace(/\s/g, ' ');
+    expect(isk).toContain('1 000');
+    expect(isk).not.toContain('100 000');
+    expect(Money.of(250000, 'UGX').format('en-US')).toContain('2,500');
+    expect(currencyDigits('ISK')).toBe(2);
+    expect(currencyDigits('UGX')).toBe(2);
+  });
+
+  it('décimales : JPY=0, USD=2, KWD=3', () => {
+    expect(currencyDigits('JPY')).toBe(0);
+    expect(currencyDigits('USD')).toBe(2);
+    expect(currencyDigits('EUR')).toBe(2);
+    expect(currencyDigits('KWD')).toBe(3);
+    expect(Money.of(1234, 'KWD').format('en-US')).toContain('1.234');
   });
 
   it('compare et teste le zéro', () => {

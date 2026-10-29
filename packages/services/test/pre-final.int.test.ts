@@ -20,6 +20,7 @@ beforeEach(async () => {
 /** Dossier ouvert alors que la carte par défaut du client est `pm_old` ; dernier avis prévu le 13 oct. à 08:00Z. */
 async function open(deps: TestDeps, s: Scenario) {
   deps.stripe.addCustomer(s.account, { id: s.customerId, email: 'c@example.com', name: 'Camille', locale: 'fr', defaultPaymentMethodId: 'pm_old' });
+  deps.stripe.addInvoice(s.account, { id: s.invoiceId, customerId: s.customerId, subscriptionId: s.subscriptionId, status: 'open', amountDue: 2900, amountPaid: 0, currency: 'EUR', attemptCount: 1, lastErrorCode: 'card_declined', failedPaymentMethodId: 'pm_old' });
   await deliver(deps, s, 'invoice.payment_failed', invoiceObject(s));
   await processInbox(deps);
   return (await getCaseByInvoice(db.pool, s.tenantId, s.invoiceId))!;
@@ -47,6 +48,23 @@ describe('retry la veille du dernier avis', () => {
     expect((await listCaseActions(db.pool, s.tenantId, c.id)).map((a) => a.action)).toContain('retry.pre_final');
     expect(await runPreFinalRetries(deps)).toEqual({ attempted: 0 });
     expect(deps.stripe.chargeCount(s.invoiceId)).toBe(1);
+  });
+
+  it('dossier clôturé manuellement entre la sélection et le paiement : la carte n’est pas débitée', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await open(deps, s);
+    await deps.stripe.setDefaultPaymentMethod(s.account, { customerId: s.customerId, paymentMethodId: 'pm_new' });
+    deps.stripe.setCardBehavior('pm_new', 'succeed');
+    deps.clock.set(new Date('2026-10-12T12:00:00Z'));
+    const real = deps.stripe.retrieveCustomer.bind(deps.stripe);
+    deps.stripe.retrieveCustomer = async (...a: Parameters<typeof real>) => {
+      const cu = await real(...a);
+      await db.pool.query(`update recovery_cases set state = 'CLOSED_MANUAL' where id = $1`, [c.id]);
+      return cu;
+    };
+    expect(await runPreFinalRetries(deps)).toEqual({ attempted: 0 });
+    expect(deps.stripe.chargeCount(s.invoiceId)).toBe(0);
   });
 
   it('même carte que celle en échec : aucun retry', async () => {

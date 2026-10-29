@@ -1,4 +1,5 @@
 import type { PoolClient } from 'pg';
+import { logAction } from '@recoverkit/db';
 import type { Deps } from '../deps';
 import { HANDLERS, type HandlerResult } from './handlers';
 import { loadTenant, lockTenant, raiseAlert } from '../recovery/ops';
@@ -6,6 +7,24 @@ import { loadTenant, lockTenant, raiseAlert } from '../recovery/ops';
 /** Délais avant chaque nouvel essai ; au 5e échec l'événement est marqué `dead`. */
 export const BACKOFF_MINUTES = [1, 5, 30, 120];
 export const MAX_ATTEMPTS = BACKOFF_MINUTES.length + 1;
+
+/**
+ * Évènements qui ne font que clôturer un dossier ou écrire au ledger (aucun email, aucun débit) :
+ * ils sont exécutés même si le tenant est SUSPENDED (connexion Stripe ACTIVE), sinon un paiement,
+ * une annulation ou un remboursement serait perdu définitivement (consommé comme « ignored »).
+ * Connexion REVOKED : l'API Stripe du compte révoqué est inutilisable, l'évènement est ignoré et journalisé ;
+ * la réconciliation lancée à la reconnexion (reconcileInBackground) rattrape paiements et clôtures.
+ */
+const CLOSING_EVENTS = new Set([
+  'invoice.paid',
+  'invoice.payment_succeeded',
+  'invoice.voided',
+  'invoice.marked_uncollectible',
+  'customer.subscription.deleted',
+  'customer.subscription.updated',
+  'charge.refunded',
+  'charge.dispute.created',
+]);
 
 export interface ProcessStats {
   processed: number;
@@ -40,8 +59,10 @@ async function processOne(deps: Deps): Promise<One> {
       const conn = await client.query(`select status, stripe_account_id from stripe_connections where tenant_id = $1`, [claimed.tenant_id]);
       const active = conn.rows[0]?.status === 'ACTIVE' && tenant?.status === 'ACTIVE';
       const isDeauth = claimed.type === 'account.application.deauthorized';
-      if (tenant && conn.rows[0] && (active || isDeauth)) {
+      const connStatus: string | undefined = conn.rows[0]?.status;
+      if (tenant && conn.rows[0] && (active || isDeauth || (CLOSING_EVENTS.has(claimed.type) && connStatus === 'ACTIVE'))) {
         const evt = claimed.payload;
+        // Compromis accepté : les appels Stripe des gestionnaires se font sous le verrou du tenant (clés d'idempotence + gardes).
         result = await handler({
           deps,
           db: client,
@@ -55,6 +76,9 @@ async function processOne(deps: Deps): Promise<One> {
             previousAttributes: evt.data?.previous_attributes ?? null,
           },
         });
+      } else if (tenant) {
+        const reason = connStatus === 'REVOKED' ? 'stripe_revoked' : !conn.rows[0] ? 'no_connection' : tenant.status !== 'ACTIVE' ? 'tenant_suspended' : `connection_${String(connStatus).toLowerCase()}`;
+        await logAction(client, { tenantId: tenant.id, caseId: null, actor: 'system', action: 'webhook.ignored', details: { eventId: claimed.stripe_event_id, type: claimed.type, reason } });
       }
     }
     await client.query(`update inbox_events set status = $2, processed_at = $3 where id = $1`, [

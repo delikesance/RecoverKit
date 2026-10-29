@@ -35,11 +35,41 @@ const str = (v: unknown): string | null => (typeof v === 'string' ? v : ((v as {
 async function upsertEndCustomer(ctx: EventContext, customer: { id: string; email: string | null; name: string | null; locale: string | null }) {
   const res = await ctx.db.query(
     `insert into end_customers (tenant_id, stripe_customer_id, email, name, locale) values ($1,$2,$3,$4,$5)
-     on conflict (tenant_id, stripe_customer_id) do update set email = excluded.email, name = excluded.name, locale = excluded.locale
+     on conflict (tenant_id, stripe_customer_id) do update set email = excluded.email, name = excluded.name, locale = excluded.locale,
+       anonymized_at = case when excluded.email is not null or excluded.name is not null then null else end_customers.anonymized_at end
      returning id`,
     [ctx.tenant.id, customer.id, customer.email, customer.name, customer.locale],
   );
   return res.rows[0].id as string;
+}
+
+/** Planifie la séquence d'un dossier OPEN et le passe en RECOVERING. */
+async function scheduleCaseSteps(
+  ctx: EventContext,
+  caseId: string,
+  failedAt: Date,
+  opened: { invoiceId: string; amountDue: number; currency: string } | null,
+) {
+  const { deps, db, tenant } = ctx;
+  const seq = await db.query(`select version, steps from sequences where tenant_id = $1 order by version desc limit 1`, [tenant.id]);
+  const steps: SequenceStep[] = seq.rows[0]?.steps ?? [];
+  const plans = scheduleSteps({
+    failedAt,
+    now: deps.clock.now(),
+    steps,
+    window: { startHour: tenant.sendStartHour, endHour: tenant.sendEndHour, timeZone: tenant.timeZone },
+  });
+  await insertScheduledSteps(db, caseId, tenant.id, plans);
+  await db.query(`update recovery_cases set state = $2, sequence_version = $3, updated_at = $4 where id = $1`, [
+    caseId,
+    transitionCase('OPEN', 'SEQUENCE_SCHEDULED'),
+    seq.rows[0]?.version ?? null,
+    deps.clock.now(),
+  ]);
+  if (opened) {
+    await logAction(db, { tenantId: tenant.id, caseId, actor: 'stripe', action: 'case.opened', details: opened });
+  }
+  await logAction(db, { tenantId: tenant.id, caseId, actor: 'system', action: 'steps.scheduled', details: { count: plans.length, sequenceVersion: seq.rows[0]?.version ?? null } });
 }
 
 async function handlePaymentFailed(ctx: EventContext): Promise<HandlerResult> {
@@ -72,22 +102,32 @@ async function handlePaymentFailed(ctx: EventContext): Promise<HandlerResult> {
       failureCode, attemptCount: inv.attemptCount,
     });
     await logAction(db, { tenantId: tenant.id, caseId: row.id, actor: 'stripe', action: 'case.attempt', details: { attemptCount: row.attemptCount, failureCode } });
+    if (existing!.state === 'OPEN') {
+      // Dossier ouvert sans email : si le client en a un désormais, la séquence démarre comme à la création.
+      const customer = await deps.stripe.retrieveCustomer(account, inv.customerId);
+      if (customer.email) {
+        await upsertEndCustomer(ctx, customer);
+        await scheduleCaseSteps(ctx, row.id, existing!.failedAt, null);
+      }
+    }
     return 'processed';
   }
 
+  // La réconciliation fournit la date réelle du dernier échec (failedAt) ; sinon, celle de l'évènement.
+  const failedAt = inv.failedAt ?? event.created;
   const customer = await deps.stripe.retrieveCustomer(account, inv.customerId);
   const endCustomerId = await upsertEndCustomer(ctx, customer);
   const { row } = await upsertCase(db, {
     tenantId: tenant.id, stripeInvoiceId: invoiceId, stripeCustomerId: inv.customerId, stripeSubscriptionId: inv.subscriptionId,
-    amountDue: inv.amountDue, currency: inv.currency, planName: inv.planName ?? null, failedAt: event.created,
+    amountDue: inv.amountDue, currency: inv.currency, planName: inv.planName ?? null, failedAt,
     failureCode, attemptCount: inv.attemptCount, endCustomerId,
   });
-  if (customer.defaultPaymentMethodId) {
-    // La carte en échec est mémorisée : elle ne sera jamais « retentée » comme si elle était nouvelle.
+  if (inv.failedPaymentMethodId) {
+    // La carte réellement refusée (PaymentIntent de la facture) est mémorisée : elle ne sera jamais « retentée » comme si elle était nouvelle.
     await db.query(
       `insert into payment_attempts (case_id, tenant_id, payment_method_id, status, error_code, source, created_at)
        values ($1,$2,$3,'FAILED','initial_failure','webhook',$4) on conflict (case_id, payment_method_id) do nothing`,
-      [row.id, tenant.id, customer.defaultPaymentMethodId, deps.clock.now()],
+      [row.id, tenant.id, inv.failedPaymentMethodId, deps.clock.now()],
     );
   }
 
@@ -100,23 +140,7 @@ async function handlePaymentFailed(ctx: EventContext): Promise<HandlerResult> {
     return 'processed';
   }
 
-  const seq = await db.query(`select version, steps from sequences where tenant_id = $1 order by version desc limit 1`, [tenant.id]);
-  const steps: SequenceStep[] = seq.rows[0]?.steps ?? [];
-  const plans = scheduleSteps({
-    failedAt: event.created,
-    now: deps.clock.now(),
-    steps,
-    window: { startHour: tenant.sendStartHour, endHour: tenant.sendEndHour, timeZone: tenant.timeZone },
-  });
-  await insertScheduledSteps(db, row.id, tenant.id, plans);
-  await db.query(`update recovery_cases set state = $2, sequence_version = $3, updated_at = $4 where id = $1`, [
-    row.id,
-    transitionCase('OPEN', 'SEQUENCE_SCHEDULED'),
-    seq.rows[0]?.version ?? null,
-    deps.clock.now(),
-  ]);
-  await logAction(db, { tenantId: tenant.id, caseId: row.id, actor: 'stripe', action: 'case.opened', details: { invoiceId, amountDue: inv.amountDue, currency: inv.currency } });
-  await logAction(db, { tenantId: tenant.id, caseId: row.id, actor: 'system', action: 'steps.scheduled', details: { count: plans.length, sequenceVersion: seq.rows[0]?.version ?? null } });
+  await scheduleCaseSteps(ctx, row.id, failedAt, { invoiceId, amountDue: inv.amountDue, currency: inv.currency });
   return 'processed';
 }
 

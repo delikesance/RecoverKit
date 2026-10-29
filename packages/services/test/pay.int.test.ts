@@ -130,7 +130,7 @@ describe('startSetup', () => {
 });
 
 describe('confirmSetup', () => {
-  async function ready(deps: TestDeps, s: Scenario, pm = 'pm_new', behavior: 'succeed' | 'decline' | '3ds' = 'succeed', code = 'card_declined') {
+  async function ready(deps: TestDeps, s: Scenario, pm = 'pm_new', behavior: 'succeed' | 'decline' | '3ds' | 'processing' = 'succeed', code = 'card_declined') {
     const { token, c } = await withLink(deps, s);
     const start = await startSetup(deps, token, { ip });
     if (start.status !== 'ok') throw new Error('setup');
@@ -172,6 +172,21 @@ describe('confirmSetup', () => {
     deps.stripe.setCardBehavior('pm_good', 'succeed');
     deps.stripe.completeSetupIntent(s.account, retry.setupIntentId, 'pm_good');
     expect(await confirmSetup(deps, token, retry.setupIntentId, { ip })).toEqual({ status: 'paid' });
+  });
+
+  it('SEPA en cours : « processing », tentative PENDING, lien NON consommé, rejeu sans second débit', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const { token, c, setupIntentId } = await ready(deps, s, 'pm_sepa', 'processing');
+    expect(await confirmSetup(deps, token, setupIntentId, { ip })).toEqual({ status: 'processing' });
+    const attempt = await db.pool.query(`select status from payment_attempts where case_id = $1`, [c.id]);
+    expect(attempt.rows).toEqual([{ status: 'PENDING' }]);
+    const tok = await db.pool.query(`select used_at from payment_tokens where case_id = $1`, [c.id]);
+    expect(tok.rows[0].used_at).toBeNull();
+    const actions = await db.pool.query(`select action from action_log where case_id = $1`, [c.id]);
+    expect(actions.rows.map((r) => r.action)).toContain('payment.processing');
+    expect(await confirmSetup(deps, token, setupIntentId, { ip })).toEqual({ status: 'processing' });
+    expect((await getCaseByInvoice(db.pool, s.tenantId, s.invoiceId))!.state).toBe('RECOVERING');
   });
 
   it('3D Secure : requires_action avec le lien de la facture Stripe', async () => {

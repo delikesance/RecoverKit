@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { getCaseByInvoice, listCaseActions, listLedger, listStepsForCase } from '@recoverkit/db';
 import { createTestDb, type TestDb } from '@recoverkit/testkit';
+import { reconcileInBackground } from '../src/stripe/connect';
 import { processInbox, replayDeadEvent } from '../src/webhooks/process';
 import { makeDeps, type TestDeps } from './helpers';
 import { deliver, insertSentEmail, invoiceObject, setupScenario, type Scenario } from './scenario';
@@ -266,7 +267,7 @@ describe('retry anticipé quand la carte change', () => {
   it('setup_intent.succeeded : une tentative de paiement, jamais deux (même carte)', async () => {
     const deps = makeDeps(db);
     const s = await setupScenario(db, deps);
-    await failAndGetCase(deps, s);
+    const c0 = await failAndGetCase(deps, s);
     deps.stripe.setCardBehavior('pm_new', 'succeed');
     await deliver(deps, s, 'setup_intent.succeeded', { id: 'seti_1', object: 'setup_intent', customer: s.customerId, payment_method: 'pm_new' });
     await deliver(deps, s, 'payment_method.attached', { id: 'pm_new', object: 'payment_method', customer: s.customerId, type: 'card' });
@@ -274,6 +275,7 @@ describe('retry anticipé quand la carte change', () => {
     expect(deps.stripe.chargeCount(s.invoiceId)).toBe(1);
     const attempts = await db.pool.query(`select status from payment_attempts where tenant_id = $1`, [s.tenantId]);
     expect(attempts.rows).toEqual([{ status: 'SUCCEEDED' }]);
+    expect((await listCaseActions(db.pool, s.tenantId, c0.id)).map((a) => a.action)).toContain('retry.paid');
   });
 
   it('customer.updated avec un nouveau moyen de paiement par défaut déclenche le retry', async () => {
@@ -310,6 +312,7 @@ describe('retry anticipé quand la carte change', () => {
     await processInbox(deps);
     const attempts = await db.pool.query(`select status, error_code from payment_attempts where case_id = $1`, [c.id]);
     expect(attempts.rows).toEqual([{ status: 'FAILED', error_code: 'insufficient_funds' }]);
+    expect((await listCaseActions(db.pool, s.tenantId, c.id)).map((a) => a.action)).toContain('retry.failed');
     expect((await getCaseByInvoice(db.pool, s.tenantId, s.invoiceId))!.state).toBe('RECOVERING');
   });
 
@@ -350,6 +353,8 @@ describe('remboursements et litiges', () => {
     await processInbox(deps);
     const ledger = await listLedger(db.pool, s.tenantId);
     expect(ledger.map((l) => [l.kind, l.amount])).toEqual([['RECOVERY', 2900], ['ADJUSTMENT', -1000]]);
+    const acts = await db.pool.query(`select action from action_log where tenant_id = $1`, [s.tenantId]);
+    expect(acts.rows.map((r) => r.action)).toContain('ledger.adjusted');
   });
 
   it('un rejeu et un remboursement cumulatif n’ajustent que la différence', async () => {
@@ -469,6 +474,88 @@ describe('moteur de traitement', () => {
     expect(steps.rows[0].n).toBe(0);
   });
 
+  it('échec en milieu de handler (après plusieurs écritures) : aucune écriture partielle, puis reprise complète', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    deps.stripe.addInvoice(s.account, { id: s.invoiceId, customerId: s.customerId, subscriptionId: s.subscriptionId, status: 'open', amountDue: 2900, amountPaid: 0, currency: 'EUR', attemptCount: 1, failedPaymentMethodId: 'pm_old' });
+    const { eventId } = await deliver(deps, s, 'invoice.payment_failed', invoiceObject(s));
+    // la dernière écriture du handler (journal « steps.scheduled ») échoue : end_customer, dossier, tentative, étapes sont déjà écrits dans la transaction
+    await db.pool.query(`create or replace function audit_boom() returns trigger language plpgsql as $$ begin raise exception 'panne simulée en fin de handler'; end $$`);
+    await db.pool.query(`create trigger audit_boom before insert on action_log for each row when (new.action = 'steps.scheduled') execute function audit_boom()`);
+    try {
+      const stats = await processInbox(deps);
+      expect(stats.failed).toBe(1);
+      expect(await inbox(eventId)).toMatchObject({ status: 'pending', attempts: 1 });
+      const count = async (table: string) => (await db.pool.query(`select count(*)::int n from ${table} where tenant_id = $1`, [s.tenantId])).rows[0].n;
+      expect(await count('recovery_cases')).toBe(0);
+      expect(await count('end_customers')).toBe(0);
+      expect(await count('scheduled_steps')).toBe(0);
+      expect(await count('payment_attempts')).toBe(0);
+      expect(await count('action_log')).toBe(0);
+    } finally {
+      await db.pool.query(`drop trigger audit_boom on action_log`);
+    }
+    deps.clock.advance({ minutes: 2 });
+    await processInbox(deps);
+    expect((await inbox(eventId)).status).toBe('processed');
+    const c = (await getCaseByInvoice(db.pool, s.tenantId, s.invoiceId))!;
+    expect(c.state).toBe('RECOVERING');
+    const steps = await db.pool.query(`select count(*)::int n from scheduled_steps where case_id = $1`, [c.id]);
+    expect(steps.rows[0].n).toBeGreaterThan(0);
+  });
+
+  it('exception JS après des écritures déjà faites dans la transaction : tout est annulé (pas de demi-dossier)', async () => {
+    // Une erreur SQL met de toute façon la transaction en échec ; ici l'erreur est côté Node, la base ne la voit pas :
+    // seul un vrai rollback empêche de committer un dossier sans journal ni état.
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const { eventId } = await deliver(deps, s, 'invoice.payment_failed', invoiceObject(s));
+    const realNow = deps.clock.now.bind(deps.clock);
+    let inSchedule = 0;
+    deps.clock.now = () => {
+      // 2e lecture de l'horloge dans scheduleCaseSteps : les étapes sont déjà insérées
+      if (new Error().stack?.includes('scheduleCaseSteps') && ++inSchedule === 2) throw new Error('panne JS après écritures');
+      return realNow();
+    };
+    const stats = await processInbox(deps);
+    expect(inSchedule).toBeGreaterThanOrEqual(2); // garde-fou : la panne a bien été déclenchée au milieu du handler
+    expect(stats.failed).toBe(1);
+    const count = async (table: string) => (await db.pool.query(`select count(*)::int n from ${table} where tenant_id = $1`, [s.tenantId])).rows[0].n;
+    expect(await count('recovery_cases')).toBe(0);
+    expect(await count('end_customers')).toBe(0);
+    expect(await count('scheduled_steps')).toBe(0);
+    expect(await count('action_log')).toBe(0);
+    expect((await inbox(eventId)).status).toBe('pending');
+  });
+
+  it('échec du ledger : la clôture du dossier est annulée avec lui (pas de dossier RECOVERED sans revenu)', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    await deliver(deps, s, 'invoice.payment_failed', invoiceObject(s));
+    await processInbox(deps);
+    deps.stripe.markPaid(s.account, s.invoiceId, deps.clock.now());
+    const { eventId } = await deliver(deps, s, 'invoice.paid', invoiceObject(s, { status: 'paid', amount_paid: 2900 }));
+    await db.pool.query(`create or replace function audit_boom_ledger() returns trigger language plpgsql as $$ begin raise exception 'panne simulée ledger'; end $$`);
+    await db.pool.query(`create trigger audit_boom_ledger before insert on recovery_ledger for each row execute function audit_boom_ledger()`);
+    try {
+      expect((await processInbox(deps)).failed).toBe(1);
+      const c = (await getCaseByInvoice(db.pool, s.tenantId, s.invoiceId))!;
+      expect(c.state).toBe('RECOVERING');
+      expect(c.closedAt).toBeNull();
+      const steps = await db.pool.query(`select status from scheduled_steps where case_id = $1`, [c.id]);
+      expect(steps.rows.every((r) => r.status === 'SCHEDULED')).toBe(true);
+      const log = await db.pool.query(`select action from action_log where case_id = $1`, [c.id]);
+      expect(log.rows.map((r) => r.action)).not.toContain('case.recovered');
+    } finally {
+      await db.pool.query(`drop trigger audit_boom_ledger on recovery_ledger`);
+    }
+    deps.clock.advance({ minutes: 2 });
+    await processInbox(deps);
+    expect((await inbox(eventId)).status).toBe('processed');
+    expect((await getCaseByInvoice(db.pool, s.tenantId, s.invoiceId))!.state).toBe('RECOVERED');
+    expect(await listLedger(db.pool, s.tenantId)).toHaveLength(1);
+  });
+
   it('rejeu manuel d’un événement mort', async () => {
     const deps = makeDeps(db);
     const s = await setupScenario(db, deps);
@@ -530,5 +617,245 @@ describe('moteur de traitement', () => {
     await processInbox(deps);
     const actions = (await listCaseActions(db.pool, s.tenantId, c.id)).map((a) => a.action);
     expect(actions).toEqual(expect.arrayContaining(['case.opened', 'case.recovered', 'ledger.recorded']));
+  });
+});
+
+describe('audit webhooks', () => {
+  const caseState = async (s: Scenario) => (await getCaseByInvoice(db.pool, s.tenantId, s.invoiceId))!;
+  const actionsOf = async (s: Scenario, caseId: string) => (await listCaseActions(db.pool, s.tenantId, caseId)).map((a) => a.action);
+
+  describe.each([
+    ['tenant SUSPENDED', (s: Scenario) => db.pool.query(`update tenants set status = 'SUSPENDED' where id = $1`, [s.tenantId])],
+  ])('évènements de clôture avec %s', (_label, degrade) => {
+    it('invoice.paid : dossier RECOVERED et ligne ledger, évènement traité', async () => {
+      const deps = makeDeps(db);
+      const s = await setupScenario(db, deps);
+      const c = await failAndGetCase(deps, s);
+      await degrade(s);
+      deps.stripe.markPaid(s.account, s.invoiceId);
+      const { eventId } = await deliver(deps, s, 'invoice.paid', invoiceObject(s, { status: 'paid', amount_paid: 2900 }));
+      await processInbox(deps);
+      expect((await inbox(eventId)).status).toBe('processed');
+      expect((await caseState(s)).state).toBe('RECOVERED');
+      expect((await listLedger(db.pool, s.tenantId)).map((l) => [l.kind, l.amount])).toEqual([['RECOVERY', 2900]]);
+      expect((await listStepsForCase(db.pool, s.tenantId, c.id)).every((x) => x.status === 'CANCELED')).toBe(true);
+    });
+
+    it('voided et subscription.deleted sont aussi traités', async () => {
+      const deps = makeDeps(db);
+      const a = await setupScenario(db, deps);
+      const b = await setupScenario(db, deps);
+      await failAndGetCase(deps, a);
+      await failAndGetCase(deps, b);
+      await degrade(a);
+      await degrade(b);
+      await deliver(deps, a, 'invoice.voided', invoiceObject(a, { status: 'void' }));
+      await deliver(deps, b, 'customer.subscription.deleted', { id: b.subscriptionId, object: 'subscription', customer: b.customerId });
+      await processInbox(deps);
+      expect((await caseState(a)).state).toBe('CANCELED');
+      expect((await caseState(b)).state).toBe('CANCELED');
+    });
+
+    it('un évènement qui enverrait ou ouvrirait quelque chose reste ignoré', async () => {
+      const deps = makeDeps(db);
+      const s = await setupScenario(db, deps);
+      await failAndGetCase(deps, s);
+      await degrade(s);
+      const { eventId } = await deliver(deps, s, 'setup_intent.succeeded', { id: 'seti_1', object: 'setup_intent', customer: s.customerId, payment_method: 'pm_x' });
+      await processInbox(deps);
+      expect((await inbox(eventId)).status).toBe('ignored');
+      const n = await db.pool.query(`select count(*)::int n from payment_attempts where tenant_id = $1`, [s.tenantId]);
+      expect(n.rows[0].n).toBe(0);
+    });
+  });
+
+  describe('évènements de clôture avec connexion REVOKED', () => {
+    it('ignorés (aucun appel à l’API du compte révoqué), journalisés ; la réconciliation rattrape à la reconnexion', async () => {
+      const deps = makeDeps(db);
+      const s = await setupScenario(db, deps);
+      await failAndGetCase(deps, s);
+      await db.pool.query(`update stripe_connections set status = 'REVOKED' where tenant_id = $1`, [s.tenantId]);
+      deps.stripe.markPaid(s.account, s.invoiceId);
+      const { eventId } = await deliver(deps, s, 'invoice.paid', invoiceObject(s, { status: 'paid', amount_paid: 2900 }));
+      const stats = await processInbox(deps);
+      expect(stats).toMatchObject({ failed: 0 });
+      expect((await inbox(eventId)).status).toBe('ignored');
+      expect((await caseState(s)).state).toBe('RECOVERING');
+      expect((await db.pool.query(`select details from action_log where tenant_id = $1 and action = 'webhook.ignored'`, [s.tenantId])).rows[0].details).toMatchObject({ type: 'invoice.paid', reason: 'stripe_revoked' });
+
+      // reconnexion : la réconciliation (reconcileInBackground → reconcileTenant) clôture le dossier payé
+      await db.pool.query(`update stripe_connections set status = 'ACTIVE' where tenant_id = $1`, [s.tenantId]);
+      await reconcileInBackground(deps, s.tenantId);
+      await processInbox(deps);
+      expect((await caseState(s)).state).toBe('RECOVERED');
+    });
+  });
+
+  describe.each(['LOST', 'CLOSED_MANUAL', 'CANCELED'])('paiement après passage en %s', (state) => {
+    it('écrit la ligne RECOVERY, journalise case.paid_after_close, ne rouvre pas, idempotent', async () => {
+      const deps = makeDeps(db);
+      const s = await setupScenario(db, deps);
+      const c = await failAndGetCase(deps, s);
+      await insertSentEmail(db, s, c.id, { sentAt: new Date('2026-10-01T09:05:00Z') });
+      await db.pool.query(`update recovery_cases set state = $2, closed_at = now() where id = $1`, [c.id, state]);
+      deps.clock.advance({ days: 1 });
+      deps.stripe.markPaid(s.account, s.invoiceId, deps.clock.now());
+      await deliver(deps, s, 'invoice.paid', invoiceObject(s, { status: 'paid', amount_paid: 2900 }));
+      await deliver(deps, s, 'invoice.payment_succeeded', invoiceObject(s, { status: 'paid', amount_paid: 2900 }));
+      await processInbox(deps);
+
+      expect((await caseState(s)).state).toBe(state);
+      const ledger = await listLedger(db.pool, s.tenantId);
+      expect(ledger).toHaveLength(1);
+      expect(ledger[0]).toMatchObject({ kind: 'RECOVERY', attribution: 'ASSISTED', amount: 2900 });
+      const acts = (await actionsOf(s, c.id)).filter((x) => x === 'case.paid_after_close');
+      expect(acts).toHaveLength(1);
+      // une écriture ledger dédoublonnée ne doit pas produire un second « ledger.recorded »
+      expect((await actionsOf(s, c.id)).filter((x) => x === 'ledger.recorded')).toHaveLength(1);
+    });
+  });
+
+  it('remboursement traité avant l’écriture RECOVERY : évènement reporté puis appliqué', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    await failAndGetCase(deps, s);
+    const { eventId } = await deliver(deps, s, 'charge.refunded', { id: 'ch_1', object: 'charge', invoice: s.invoiceId, amount: 2900, amount_refunded: 1000, currency: 'eur' });
+    const stats = await processInbox(deps);
+    expect(stats.failed).toBe(1);
+    expect(await inbox(eventId)).toMatchObject({ status: 'pending', attempts: 1 });
+
+    deps.stripe.markPaid(s.account, s.invoiceId);
+    await deliver(deps, s, 'invoice.paid', invoiceObject(s, { status: 'paid', amount_paid: 2900 }));
+    await processInbox(deps); // paid écrit RECOVERY (le refund n'est pas encore échu)
+    deps.clock.advance({ minutes: 2 });
+    await processInbox(deps);
+    expect((await inbox(eventId)).status).toBe('processed');
+    expect((await listLedger(db.pool, s.tenantId)).map((l) => [l.kind, l.amount])).toEqual([['RECOVERY', 2900], ['ADJUSTMENT', -1000]]);
+  });
+
+  it('dossier OPEN sans email : un échec ultérieur avec email planifie les étapes et passe en RECOVERING', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps, { email: null });
+    const c = await failAndGetCase(deps, s);
+    expect(c.state).toBe('OPEN');
+    deps.stripe.addCustomer(s.account, { id: s.customerId, email: 'nouveau@example.com', name: 'Camille Roux', locale: 'fr', defaultPaymentMethodId: null });
+    deps.clock.advance({ hours: 2 });
+    await deliver(deps, s, 'invoice.payment_failed', invoiceObject(s, { attempt_count: 2 }));
+    await processInbox(deps);
+    const after = await caseState(s);
+    expect(after.state).toBe('RECOVERING');
+    expect((await listStepsForCase(db.pool, s.tenantId, c.id)).length).toBeGreaterThan(0);
+    expect(await actionsOf(s, c.id)).toContain('steps.scheduled');
+    const cust = await db.pool.query(`select email from end_customers where tenant_id = $1`, [s.tenantId]);
+    expect(cust.rows[0].email).toBe('nouveau@example.com');
+  });
+
+  it('closeCase annule aussi les étapes SENDING', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await failAndGetCase(deps, s);
+    await db.pool.query(`update scheduled_steps set status = 'SENDING', reserved_at = now() where case_id = $1 and step_index = 0`, [c.id]);
+    deps.stripe.markPaid(s.account, s.invoiceId);
+    await deliver(deps, s, 'invoice.paid', invoiceObject(s, { status: 'paid', amount_paid: 2900 }));
+    await processInbox(deps);
+    const steps = await listStepsForCase(db.pool, s.tenantId, c.id);
+    expect(steps.some((x) => x.status === 'SENDING')).toBe(false);
+    expect(steps.every((x) => x.status === 'CANCELED')).toBe(true);
+  });
+
+  it('client anonymisé puis ré-alimenté : anonymized_at remis à NULL', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    await db.pool.query(
+      `insert into end_customers (tenant_id, stripe_customer_id, anonymized_at) values ($1,$2,now())`,
+      [s.tenantId, s.customerId],
+    );
+    await failAndGetCase(deps, s);
+    const cust = await db.pool.query(`select email, anonymized_at from end_customers where tenant_id = $1`, [s.tenantId]);
+    expect(cust.rows[0].email).not.toBeNull();
+    expect(cust.rows[0].anonymized_at).toBeNull();
+  });
+
+  it('dossier ouvert avec la date réelle du dernier échec quand la facture l’expose (failedAt)', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const real = new Date('2026-09-28T10:00:00Z');
+    deps.stripe.addInvoice(s.account, { id: s.invoiceId, customerId: s.customerId, subscriptionId: s.subscriptionId, status: 'open', amountDue: 2900, amountPaid: 0, currency: 'EUR', attemptCount: 1, lastErrorCode: 'card_declined', failedAt: real } as any);
+    const c = await failAndGetCase(deps, s);
+    expect(c.failedAt.toISOString()).toBe(real.toISOString());
+  });
+
+  it('montant encaissé : le ledger porte amount_paid, pas amount_due ; 0 encaissé : aucune ligne', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const z = await setupScenario(db, deps);
+    await failAndGetCase(deps, s);
+    await failAndGetCase(deps, z);
+    const paid = (sc: Scenario, amountPaid: number) =>
+      deps.stripe.addInvoice(sc.account, { id: sc.invoiceId, customerId: sc.customerId, subscriptionId: sc.subscriptionId, status: 'paid', amountDue: 2900, amountPaid, currency: 'EUR', attemptCount: 1, paidAt: deps.clock.now() });
+    paid(s, 2000);
+    paid(z, 0);
+    await deliver(deps, s, 'invoice.paid', invoiceObject(s, { status: 'paid', amount_paid: 2000 }));
+    await deliver(deps, z, 'invoice.paid', invoiceObject(z, { status: 'paid', amount_paid: 0 }));
+    const stats = await processInbox(deps);
+    expect(stats.failed).toBe(0);
+    expect((await listLedger(db.pool, s.tenantId)).map((l) => l.amount)).toEqual([2000]);
+    expect(await listLedger(db.pool, z.tenantId)).toHaveLength(0);
+    expect((await caseState(z)).state).toBe('RECOVERED');
+  });
+});
+
+describe('carte et code de l’échec (PaymentIntent de la facture)', () => {
+  const failedInvoice = (s: Scenario, over: Record<string, unknown>) =>
+    ({ id: s.invoiceId, customerId: s.customerId, subscriptionId: s.subscriptionId, status: 'open', amountDue: 2900, amountPaid: 0, currency: 'EUR', attemptCount: 1, ...over }) as any;
+
+  it('mémorise la carte réellement refusée, pas la carte par défaut du client', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    deps.stripe.addCustomer(s.account, { id: s.customerId, email: 'c@example.com', name: 'Camille', locale: 'fr', defaultPaymentMethodId: 'pm_B' });
+    deps.stripe.addInvoice(s.account, failedInvoice(s, { lastErrorCode: 'insufficient_funds', failedPaymentMethodId: 'pm_A' }));
+    const c = await failAndGetCase(deps, s);
+    const rows = await db.pool.query(`select payment_method_id, status, error_code from payment_attempts where case_id = $1`, [c.id]);
+    expect(rows.rows).toEqual([{ payment_method_id: 'pm_A', status: 'FAILED', error_code: 'initial_failure' }]);
+
+    // pm_B n'a jamais été essayé : le client peut l'utiliser, un rejeu de pm_A ne débite pas
+    deps.stripe.setCardBehavior('pm_B', 'succeed');
+    await deliver(deps, s, 'setup_intent.succeeded', { id: 'seti_b', object: 'setup_intent', customer: s.customerId, payment_method: 'pm_B' });
+    await deliver(deps, s, 'payment_method.attached', { id: 'pm_A', object: 'payment_method', customer: s.customerId, type: 'card' });
+    await processInbox(deps);
+    expect(deps.stripe.chargeCount(s.invoiceId)).toBe(1);
+  });
+
+  it('carte inconnue (aucun défaut chez le client, aucune carte sur l’échec) : aucune tentative inventée', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    deps.stripe.addCustomer(s.account, { id: s.customerId, email: 'c@example.com', name: 'Camille', locale: 'fr', defaultPaymentMethodId: 'pm_B' });
+    const c = await failAndGetCase(deps, s);
+    const n = await db.pool.query(`select count(*)::int n from payment_attempts where case_id = $1`, [c.id]);
+    expect(n.rows[0].n).toBe(0);
+  });
+
+  it('code d’échec : celui du PaymentIntent de la facture, pas celui de l’évènement', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    deps.stripe.addInvoice(s.account, failedInvoice(s, { lastErrorCode: 'insufficient_funds' }));
+    await deliver(deps, s, 'invoice.payment_failed', invoiceObject(s, { last_payment_error: { code: 'card_declined' } }));
+    await processInbox(deps);
+    const r = await db.pool.query(`select last_failure_code from recovery_cases where tenant_id = $1`, [s.tenantId]);
+    expect(r.rows[0].last_failure_code).toBe('insufficient_funds');
+  });
+
+  it('paiement asynchrone (SEPA) en cours : tentative PENDING, journal retry.processing, facture non marquée payée', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await failAndGetCase(deps, s);
+    deps.stripe.setCardBehavior('pm_sepa', 'processing');
+    await deliver(deps, s, 'setup_intent.succeeded', { id: 'seti_sepa', object: 'setup_intent', customer: s.customerId, payment_method: 'pm_sepa' });
+    await processInbox(deps);
+    const a = await db.pool.query(`select status, error_code from payment_attempts where case_id = $1`, [c.id]);
+    expect(a.rows).toEqual([{ status: 'PENDING', error_code: null }]);
+    expect((await listCaseActions(db.pool, s.tenantId, c.id)).map((x) => x.action)).toContain('retry.processing');
+    expect((await getCaseByInvoice(db.pool, s.tenantId, s.invoiceId))!.state).toBe('RECOVERING');
+    expect(await listLedger(db.pool, s.tenantId)).toHaveLength(0);
   });
 });

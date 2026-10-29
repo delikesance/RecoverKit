@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { DEFAULT_SEQUENCE, hashToken } from '@recoverkit/core';
 import { hitRateLimit, withTransaction } from '@recoverkit/db';
 import type { Deps } from '../deps';
+import { DEFAULT_TENANT_NAME } from '../settings/general';
 import { SESSION_TTL_SECONDS } from './http';
 
 const LOGIN_TTL_MS = 15 * 60_000;
@@ -69,7 +70,7 @@ export async function consumeLoginLink(deps: Deps, token: string): Promise<Consu
       tenantId = existing.rows[0].tenant_id;
     } else {
       isNew = true;
-      const t = await tx.query(`insert into tenants (name) values ($1) returning id`, ['Mon entreprise']);
+      const t = await tx.query(`insert into tenants (name) values ($1) returning id`, [DEFAULT_TENANT_NAME]);
       tenantId = t.rows[0].id;
       const u = await tx.query(`insert into users (tenant_id, email) values ($1, $2) returning id`, [tenantId, email]);
       userId = u.rows[0].id;

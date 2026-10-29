@@ -1,6 +1,7 @@
 import { monthlyAmount, planForMrr } from '@recoverkit/core';
 import { logAction, withTransaction } from '@recoverkit/db';
 import type { Deps } from '../deps';
+import { reconcileTenant } from '../ops/reconcile';
 import { raiseAlert } from '../recovery/ops';
 import { verifyStripeSignature } from '../webhooks/signature';
 
@@ -45,6 +46,13 @@ export async function startCheckout(
   const plan = deps.config.plans.find((p) => p.key === planKey);
   if (!plan) return { status: 'invalid_plan' };
   const customerId = await ensureCustomer(deps, tenantId);
+
+  // Un abonnement vivant existe déjà : on gère le changement depuis le portail, pas via un second checkout.
+  const live = (await deps.pool.query(`select status from billing_subscriptions where tenant_id = $1`, [tenantId])).rows[0];
+  if (live && (live.status === 'ACTIVE' || live.status === 'TRIALING' || live.status === 'PAST_DUE')) {
+    const portal = await deps.billing.createPortalSession({ customerId, returnUrl: `${deps.config.appUrl}/app/billing` });
+    return { status: 'ok', url: portal.url };
+  }
 
   // L'essai gratuit déjà entamé n'est pas perdu : il est reporté sur l'abonnement.
   const created = (await deps.pool.query(`select created_at from tenants where id = $1`, [tenantId])).rows[0].created_at as Date;
@@ -96,6 +104,7 @@ export async function receivePlatformWebhook(deps: Deps, req: { rawBody: string;
     const fresh = await tx.query(`insert into provider_events (id, received_at) values ($1,$2) on conflict do nothing returning id`, [`stripe_platform:${event.id}`, now]);
     if (fresh.rowCount !== 1) return { status: 'duplicate', httpStatus: 200 };
     const obj = event.data?.object ?? {};
+    const eventAt = new Date((Number(event.created) || now.getTime() / 1000) * 1000);
     const planOf = (priceId: string | null) => deps.config.plans.find((p) => p.priceId === priceId)?.key ?? null;
 
     switch (event.type) {
@@ -105,12 +114,13 @@ export async function receivePlatformWebhook(deps: Deps, req: { rawBody: string;
         if (!tenantId || !subId) break;
         const sub = await deps.billing.retrieveSubscription(subId);
         await tx.query(
-          `insert into billing_subscriptions (tenant_id, stripe_customer_id, stripe_subscription_id, plan, status, current_period_end, cancel_at_period_end, updated_at)
-           values ($1,$2,$3,$4,$5,$6,$7,$8)
+          `insert into billing_subscriptions (tenant_id, stripe_customer_id, stripe_subscription_id, plan, status, current_period_end, cancel_at_period_end, updated_at, last_event_at)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
            on conflict (tenant_id) do update set stripe_customer_id = excluded.stripe_customer_id, stripe_subscription_id = excluded.stripe_subscription_id,
              plan = excluded.plan, status = excluded.status, current_period_end = excluded.current_period_end,
-             cancel_at_period_end = excluded.cancel_at_period_end, updated_at = excluded.updated_at`,
-          [tenantId, sub.customerId, sub.id, planOf(sub.priceId), mapSubscriptionStatus(sub.status), sub.currentPeriodEnd, sub.cancelAtPeriodEnd, now],
+             cancel_at_period_end = excluded.cancel_at_period_end, updated_at = excluded.updated_at,
+             last_event_at = greatest(billing_subscriptions.last_event_at, $9::timestamptz)`,
+          [tenantId, sub.customerId, sub.id, planOf(sub.priceId), mapSubscriptionStatus(sub.status), sub.currentPeriodEnd, sub.cancelAtPeriodEnd, now, eventAt],
         );
         await logAction(tx, { tenantId, caseId: null, actor: 'billing', action: 'billing.subscribed', details: { plan: planOf(sub.priceId) } });
         break;
@@ -123,13 +133,16 @@ export async function receivePlatformWebhook(deps: Deps, req: { rawBody: string;
         const item = obj.items?.data?.[0];
         const status = event.type === 'customer.subscription.deleted' ? 'CANCELED' : mapSubscriptionStatus(obj.status);
         const periodEnd = item?.current_period_end ?? obj.current_period_end ?? null;
-        await tx.query(
+        const applied = await tx.query(
           `update billing_subscriptions set stripe_subscription_id = $2, status = $3, plan = coalesce($4, plan),
              current_period_end = coalesce($5, current_period_end), cancel_at_period_end = $6,
              past_due_since = case when $3 = 'PAST_DUE' then coalesce(past_due_since, $7) else null end, updated_at = $7
-           where tenant_id = $1`,
-          [tenantId, obj.id, status, planOf(item?.price?.id ?? null), periodEnd ? new Date(periodEnd * 1000) : null, !!obj.cancel_at_period_end, now],
+             , last_event_at = $8
+           where tenant_id = $1 and (stripe_subscription_id is null or stripe_subscription_id = $2)
+             and (last_event_at is null or last_event_at <= $8)`,
+          [tenantId, obj.id, status, planOf(item?.price?.id ?? null), periodEnd ? new Date(periodEnd * 1000) : null, !!obj.cancel_at_period_end, now, eventAt],
         );
+        if (!applied.rowCount) break; // autre abonnement que le courant, ou évènement plus ancien que le dernier appliqué
         if (status !== 'PAST_DUE') {
           await tx.query(`update system_alerts set resolved_at = $2 where tenant_id = $1 and kind = 'billing_past_due' and resolved_at is null`, [tenantId, now]);
         }
@@ -138,10 +151,13 @@ export async function receivePlatformWebhook(deps: Deps, req: { rawBody: string;
       case 'invoice.payment_failed': {
         const tenantId = await tenantOfCustomer(deps, idOf(obj.customer));
         if (!tenantId) break;
-        await tx.query(
-          `update billing_subscriptions set status = 'PAST_DUE', past_due_since = coalesce(past_due_since, $2), updated_at = $2 where tenant_id = $1`,
-          [tenantId, now],
+        const failed = await tx.query(
+          `update billing_subscriptions set status = 'PAST_DUE', past_due_since = coalesce(past_due_since, $2), updated_at = $2, last_event_at = $3
+            where tenant_id = $1 and (last_event_at is null or last_event_at <= $3)
+              and ($4::text is null or stripe_subscription_id is null or stripe_subscription_id = $4)`,
+          [tenantId, now, eventAt, idOf(obj.subscription)],
         );
+        if (!failed.rowCount) break;
         await raiseAlert(tx, {
           tenantId,
           kind: 'billing_past_due',
@@ -153,10 +169,13 @@ export async function receivePlatformWebhook(deps: Deps, req: { rawBody: string;
       case 'invoice.paid': {
         const tenantId = await tenantOfCustomer(deps, idOf(obj.customer));
         if (!tenantId) break;
-        await tx.query(
-          `update billing_subscriptions set past_due_since = null, status = case when status = 'PAST_DUE' then 'ACTIVE' else status end, updated_at = $2 where tenant_id = $1`,
-          [tenantId, now],
+        const paid = await tx.query(
+          `update billing_subscriptions set past_due_since = null, status = case when status = 'PAST_DUE' then 'ACTIVE' else status end, updated_at = $2, last_event_at = $3
+            where tenant_id = $1 and (last_event_at is null or last_event_at <= $3)
+              and ($4::text is null or stripe_subscription_id is null or stripe_subscription_id = $4)`,
+          [tenantId, now, eventAt, idOf(obj.subscription)],
         );
+        if (!paid.rowCount) break;
         await tx.query(`update system_alerts set resolved_at = $2 where tenant_id = $1 and kind = 'billing_past_due' and resolved_at is null`, [tenantId, now]);
         break;
       }
@@ -166,7 +185,7 @@ export async function receivePlatformWebhook(deps: Deps, req: { rawBody: string;
 }
 
 export type MrrResult =
-  | { status: 'ok'; mrr: number; currency: string | null; suggestedPlan: string | null; exceeded: boolean }
+  | { status: 'ok'; mrr: number; currency: string; byCurrency: Record<string, number>; suggestedPlan: string | null; exceeded: boolean; ignoredCurrencies: string[] }
   | { status: 'no_connection' };
 
 /** Revenu mensuel récurrent du tenant (via Stripe), palier conseillé, alerte de dépassement (jamais de blocage). */
@@ -179,17 +198,21 @@ export async function computeTenantMrr(deps: Deps, tenantId: string): Promise<Mr
   for (const s of subs) {
     byCurrency.set(s.currency, (byCurrency.get(s.currency) ?? 0) + monthlyAmount({ amount: s.amount, interval: s.interval, intervalCount: s.intervalCount }));
   }
-  const [currency, mrr] = [...byCurrency.entries()].sort((a, b) => b[1] - a[1])[0] ?? [null, 0];
+  // Les paliers sont exprimés dans leur devise (champ currency, EUR par défaut) : les autres devises sont ignorées pour le palier et signalées.
+  const tierCurrency = deps.config.plans[0]?.currency ?? 'EUR';
+  // MRR de référence = celui de la devise des paliers (dashboard, palier conseillé et dépassement restent cohérents) ; le détail multi-devises est renvoyé.
+  const tierMrr = byCurrency.get(tierCurrency) ?? 0;
+  const ignoredCurrencies = [...byCurrency.keys()].filter((c) => c !== tierCurrency);
 
-  const { plan: suggested } = planForMrr(deps.config.plans, mrr);
+  const { plan: suggested } = planForMrr(deps.config.plans, tierMrr);
   const row = (await deps.pool.query(`select plan from billing_subscriptions where tenant_id = $1`, [tenantId])).rows[0];
   const current = deps.config.plans.find((p) => p.key === row?.plan) ?? null;
-  const exceeded = !!current && current.maxMrr !== null && mrr > current.maxMrr;
+  const exceeded = !!current && current.maxMrr !== null && tierMrr > current.maxMrr;
 
   await deps.pool.query(
     `insert into billing_subscriptions (tenant_id, status, mrr_amount, mrr_currency, mrr_updated_at) values ($1,'NONE',$2,$3,$4)
      on conflict (tenant_id) do update set mrr_amount = excluded.mrr_amount, mrr_currency = excluded.mrr_currency, mrr_updated_at = excluded.mrr_updated_at`,
-    [tenantId, mrr, currency, deps.clock.now()],
+    [tenantId, tierMrr, tierCurrency, deps.clock.now()],
   );
   if (exceeded && suggested) {
     await raiseAlert(deps.pool, {
@@ -201,12 +224,13 @@ export async function computeTenantMrr(deps: Deps, tenantId: string): Promise<Mr
   } else {
     await deps.pool.query(`update system_alerts set resolved_at = $2 where tenant_id = $1 and kind = 'plan_exceeded' and resolved_at is null`, [tenantId, deps.clock.now()]);
   }
-  return { status: 'ok', mrr, currency, suggestedPlan: suggested?.key ?? null, exceeded };
+  return { status: 'ok', mrr: tierMrr, currency: tierCurrency, byCurrency: Object.fromEntries(byCurrency), suggestedPlan: suggested?.key ?? null, exceeded, ignoredCurrencies };
 }
 
 /** Suspend (ou réactive) les tenants selon l'essai et l'abonnement ; sans paliers configurés, ne fait rien. */
 export async function enforceBilling(deps: Deps): Promise<{ suspended: number; reactivated: number }> {
   const out = { suspended: 0, reactivated: 0 };
+  const reactivatedIds: string[] = [];
   if (deps.config.plans.length === 0) return out;
   const now = deps.clock.now().getTime();
   const rows = await deps.pool.query(
@@ -234,6 +258,13 @@ export async function enforceBilling(deps: Deps): Promise<{ suspended: number; r
     await deps.pool.query(`update tenants set status = $2 where id = $1`, [r.id, desired]);
     await logAction(deps.pool, { tenantId: r.id, caseId: null, actor: 'billing', action: desired === 'SUSPENDED' ? 'tenant.suspended' : 'tenant.reactivated', details: {} });
     out[desired === 'SUSPENDED' ? 'suspended' : 'reactivated']++;
+    if (desired === 'ACTIVE') reactivatedIds.push(r.id);
+  }
+  // Les webhooks reçus pendant la suspension ont été ignorés : on rattrape l'écart avec Stripe, sans attendre ni échouer.
+  for (const tenantId of reactivatedIds) {
+    reconcileTenant(deps, tenantId).catch((e: Error) => {
+      deps.log.warn({ tenantId, err: e.message }, 'réconciliation Stripe impossible après réactivation');
+    });
   }
   return out;
 }

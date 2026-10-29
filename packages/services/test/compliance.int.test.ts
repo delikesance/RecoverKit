@@ -4,7 +4,7 @@ import { runWeeklyDigests, isoWeekOf } from '../src/notifications/digest';
 import { notifyFounderAlerts } from '../src/notifications/alerts';
 import { exportTenantData } from '../src/compliance/export';
 import { deleteTenant } from '../src/compliance/delete';
-import { purgeRetention } from '../src/compliance/retention';
+import { purgeRetention, INBOX_RETENTION_DAYS } from '../src/compliance/retention';
 import { getSession } from '../src/auth/auth';
 import { makeDeps } from './helpers';
 
@@ -99,6 +99,27 @@ describe('digest hebdomadaire', () => {
     await tenantWithUser('calme@example.com');
     await runWeeklyDigests(deps);
     for (const e of ['off@example.com', 'susp@example.com', 'calme@example.com']) expect(deps.mailer.messagesTo(e)).toHaveLength(0);
+  });
+
+  it('aucun email vide quand la semaine n’a que du NATURAL et aucun dossier à risque', async () => {
+    const deps = makeDeps(db, MONDAY_8H);
+    await tenantWithUser('naturel@example.com');
+    const t = (await db.pool.query(`select id from tenants order by created_at desc limit 1`)).rows[0];
+    await ledger(t.id, 3100, '2026-10-22T11:00:00Z', 'NATURAL');
+    await runWeeklyDigests(deps);
+    expect(deps.mailer.messagesTo('naturel@example.com')).toHaveLength(0);
+  });
+
+  it('le titre prend la devise qui a le plus récupéré, pas la première par ordre alphabétique', async () => {
+    const deps = makeDeps(db, MONDAY_8H);
+    const t = await tenantWithUser('multi@example.com');
+    const c = await seedCase(db.pool, t.id, { state: 'RECOVERED' });
+    await db.pool.query(`insert into recovery_ledger (tenant_id, case_id, invoice_id, kind, attribution, amount, currency, occurred_at) values ($1,$2,$3,'RECOVERY','ASSISTED',5000,'USD',$4)`, [t.id, c.id, c.invoiceId, new Date('2026-10-22T10:00:00Z')]);
+    await seedCase(db.pool, t.id, { state: 'RECOVERING', amountDue: 2900 });
+    await runWeeklyDigests(deps);
+    const mail = deps.mailer.messagesTo('multi@example.com')[0]!;
+    expect(mail.subject.replace(/\s/g, ' ')).toContain('50,00');
+    expect(mail.subject).not.toContain('0,00 €');
   });
 
   it('en anglais pour un tenant en anglais, et une erreur d’envoi n’empêche pas un nouvel essai', async () => {
@@ -266,5 +287,106 @@ describe('purge de rétention', () => {
     expect(await purgeRetention(deps)).toMatchObject({ customers: 0 });
     expect((await db.pool.query(`select email from end_customers where id = $1`, [cust])).rows[0].email).toBe('mix@example.com');
     expect(await purgeRetention(deps)).toMatchObject({ customers: 0, emails: 0 });
+  });
+
+  it('retourne tous les compteurs et journalise un résumé de purge par tenant concerné', async () => {
+    const deps = makeDeps(db, new Date('2026-10-28T10:00:00Z'));
+    const t = await seedTenant(db.pool);
+    const cust = (await db.pool.query(`insert into end_customers (tenant_id, stripe_customer_id, email) values ($1,'cus_sum','sum@example.com') returning id`, [t.id])).rows[0].id;
+    const old = await seedCase(db.pool, t.id, { state: 'LOST', customerId: 'cus_sum' });
+    await db.pool.query(`update recovery_cases set end_customer_id = $2, closed_at = '2025-01-01' where id = $1`, [old.id, cust]);
+    await db.pool.query(`insert into email_messages (tenant_id, case_id, step_index, idempotency_key, to_email, subject) values ($1,$2,0,$3,'x@y.z','s')`, [t.id, old.id, `${old.id}:0`]);
+    await db.pool.query(`insert into login_tokens (email, token_hash, expires_at) values ('a@b.c', $1, '2026-01-01')`, [`h${old.id}`]);
+
+    const r = await purgeRetention(deps);
+    expect(r).toMatchObject({ customers: expect.any(Number), emails: expect.any(Number), inboxEvents: expect.any(Number), loginTokens: expect.any(Number), threshold: expect.any(String) });
+    expect(r.customers).toBeGreaterThanOrEqual(1);
+    expect(r.loginTokens).toBeGreaterThanOrEqual(1);
+    const log = await db.pool.query(`select details from action_log where tenant_id = $1 and action = 'retention.purged'`, [t.id]);
+    expect(log.rows).toHaveLength(1);
+    expect(log.rows[0].details).toMatchObject({ emails: 1, customers: 1 });
+  });
+});
+
+describe('conformité : inbox_events, login_tokens, export, domaine', () => {
+  async function inbox(tenantId: string | null, account: string | null, status: string, receivedAt: Date) {
+    const id = `evt_${Math.random().toString(36).slice(2)}`;
+    await db.pool.query(
+      `insert into inbox_events (stripe_event_id, stripe_account_id, tenant_id, type, payload, status, received_at) values ($1,$2,$3,'invoice.payment_failed',$4::jsonb,$5,$6)`,
+      [id, account, tenantId, JSON.stringify({ customer_email: 'final@example.com', customer_name: 'Final' }), status, receivedAt],
+    );
+    return id;
+  }
+
+  it('la suppression du compte supprime inbox_events (par tenant_id et par stripe_account_id) et login_tokens du fondateur', async () => {
+    const deps = makeDeps(db);
+    const t = await tenantWithUser('purge-del@example.com', { name: 'Compte purge' });
+    await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,'acct_purge1','ACTIVE')`, [t.id]);
+    const byTenant = await inbox(t.id, null, 'processed', deps.clock.now());
+    const byAccount = await inbox(null, 'acct_purge1', 'pending', deps.clock.now());
+    const other = await inbox(null, 'acct_autre', 'processed', deps.clock.now());
+    await db.pool.query(`insert into login_tokens (token_hash, email, expires_at) values ('lt_del_1', 'PURGE-DEL@example.com', $1), ('lt_keep_1', 'autre@example.com', $1)`, [new Date('2030-01-01')]);
+
+    await deleteTenant(deps, t.id, { confirmName: 'Compte purge', actor: 'user:u' });
+    const left = await db.pool.query(`select stripe_event_id from inbox_events where stripe_event_id = any($1)`, [[byTenant, byAccount, other]]);
+    expect(left.rows.map((r) => r.stripe_event_id)).toEqual([other]);
+    const lt = await db.pool.query(`select token_hash from login_tokens where token_hash in ('lt_del_1','lt_keep_1')`);
+    expect(lt.rows).toEqual([{ token_hash: 'lt_keep_1' }]);
+  });
+
+  it('la rétention purge les inbox_events terminés anciens et les login_tokens expirés', async () => {
+    const deps = makeDeps(db, new Date('2026-10-28T10:00:00Z'));
+    const old = new Date(deps.clock.now().getTime() - (INBOX_RETENTION_DAYS + 1) * 86_400_000);
+    const recent = new Date(deps.clock.now().getTime() - 86_400_000);
+    const oldProcessed = await inbox(null, 'acct_r', 'processed', old);
+    const oldDead = await inbox(null, 'acct_r', 'dead', old);
+    const oldPending = await inbox(null, 'acct_r', 'pending', old);
+    const recentProcessed = await inbox(null, 'acct_r', 'processed', recent);
+    await db.pool.query(`insert into login_tokens (token_hash, email, expires_at) values ('lt_exp', 'e@example.com', $1), ('lt_valid', 'v@example.com', $2)`, [new Date('2026-10-01'), new Date('2026-12-01')]);
+
+    await purgeRetention(deps);
+    const left = await db.pool.query(`select stripe_event_id from inbox_events where stripe_account_id = 'acct_r'`);
+    expect(left.rows.map((r) => r.stripe_event_id).sort()).toEqual([oldPending, recentProcessed].sort());
+    expect(left.rows.map((r) => r.stripe_event_id)).not.toContain(oldProcessed);
+    expect(left.rows.map((r) => r.stripe_event_id)).not.toContain(oldDead);
+    const lt = await db.pool.query(`select token_hash from login_tokens where token_hash in ('lt_exp','lt_valid')`);
+    expect(lt.rows).toEqual([{ token_hash: 'lt_valid' }]);
+  });
+
+  it('la rétention anonymise un client dont seul le nom ou l’email subsiste, même avec anonymized_at déjà posé', async () => {
+    const deps = makeDeps(db, new Date('2026-10-28T10:00:00Z'));
+    const t = await seedTenant(db.pool);
+    const cust = (await db.pool.query(`insert into end_customers (tenant_id, stripe_customer_id, email, name, anonymized_at) values ($1,'cus_re','revenu@example.com','Revenu', '2026-01-01') returning id`, [t.id])).rows[0].id;
+    const c = await seedCase(db.pool, t.id, { state: 'LOST', customerId: 'cus_re' });
+    await db.pool.query(`update recovery_cases set end_customer_id = $2, closed_at = '2025-01-01' where id = $1`, [c.id, cust]);
+    await purgeRetention(deps);
+    expect((await db.pool.query(`select email, name from end_customers where id = $1`, [cust])).rows[0]).toEqual({ email: null, name: null });
+  });
+
+  it('l’export journalise tenant.exported et inclut les données du fondateur', async () => {
+    const deps = makeDeps(db);
+    const t = await tenantWithUser('fondateur-export@example.com');
+    await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,'acct_exp','ACTIVE')`, [t.id]);
+    const data: any = await exportTenantData(deps, t.id, { actor: 'user:abc' });
+    expect(data.users[0]).toMatchObject({ email: 'fondateur-export@example.com' });
+    expect(data.stripeConnections[0]).toMatchObject({ stripe_account_id: 'acct_exp' });
+    expect(JSON.stringify(data)).not.toMatch(/access_token|refresh_token/);
+    const log = await db.pool.query(`select actor from action_log where tenant_id = $1 and action = 'tenant.exported'`, [t.id]);
+    expect(log.rows).toEqual([{ actor: 'user:abc' }]);
+  });
+
+  it('la suppression du compte supprime le domaine d’envoi, et tolère un échec du fournisseur', async () => {
+    const deps = makeDeps(db);
+    const t = await tenantWithUser('dom-del@example.com', { name: 'Avec domaine' });
+    await db.pool.query(`update tenants set sender_domain = 'mail.exemple.fr', sender_domain_id = 'dom_x1' where id = $1`, [t.id]);
+    await deleteTenant(deps, t.id, { confirmName: 'Avec domaine', actor: 'user:u' });
+    expect(deps.domains.deleted).toContain('dom_x1');
+
+    const t2 = await tenantWithUser('dom-del2@example.com', { name: 'Domaine KO' });
+    await db.pool.query(`update tenants set sender_domain_id = 'dom_x2' where id = $1`, [t2.id]);
+    deps.domains.deleteDomain = async () => {
+      throw new Error('Resend KO');
+    };
+    expect(await deleteTenant(deps, t2.id, { confirmName: 'Domaine KO', actor: 'user:u' })).toEqual({ status: 'deleted' });
   });
 });

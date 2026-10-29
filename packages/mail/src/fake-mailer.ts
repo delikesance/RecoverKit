@@ -4,6 +4,8 @@ import { MailerError, type Mailer, type OutboundEmail } from './mailer';
 export class FakeMailer implements Mailer {
   readonly sent: OutboundEmail[] = [];
   private readonly byKey = new Map<string, { messageId: string; fingerprint: string }>();
+  /** Nombre d'appels à send par clé d'idempotence (rejeux et échecs compris). */
+  readonly calls = new Map<string, number>();
   private failures: Error[] = [];
   private counter = 0;
 
@@ -11,11 +13,16 @@ export class FakeMailer implements Mailer {
     this.failures.push(error);
   }
 
+  callCount(key: string): number {
+    return this.calls.get(key) ?? 0;
+  }
+
   messagesTo(to: string): OutboundEmail[] {
     return this.sent.filter((e) => e.to === to);
   }
 
   async send(email: OutboundEmail): Promise<{ messageId: string }> {
+    this.calls.set(email.idempotencyKey, this.callCount(email.idempotencyKey) + 1);
     const failure = this.failures.shift();
     if (failure) throw failure;
 

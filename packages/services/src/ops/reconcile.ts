@@ -2,13 +2,22 @@ import { insertInboxEvent } from '@recoverkit/db';
 import type { InvoiceData } from '@recoverkit/stripe';
 import type { Deps } from '../deps';
 
+const PAGE_SIZE = 500;
+
+/** Date réelle du dernier échec si la facture la fournit (défensif : absente du contrat de base). */
+function failureDate(inv: Pick<InvoiceData, 'id'>): Date | null {
+  const d = (inv as { failedAt?: unknown }).failedAt;
+  return d instanceof Date && Number.isFinite(d.getTime()) ? d : null;
+}
+
 function syntheticEvent(deps: Deps, account: string, type: string, inv: Pick<InvoiceData, 'id'>) {
   const now = deps.clock.now();
+  const failedAt = type === 'invoice.payment_failed' ? failureDate(inv) : null;
   return {
     id: `reconcile:${type}:${inv.id}:${now.toISOString().slice(0, 10)}`,
     type,
     account,
-    created: Math.floor(now.getTime() / 1000),
+    created: Math.floor((failedAt ?? now).getTime() / 1000),
     data: { object: { id: inv.id, object: 'invoice' } },
     reconciled: true,
   };
@@ -50,20 +59,32 @@ export async function reconcileTenant(deps: Deps, tenantId: string): Promise<{ o
   let opened = 0;
   for (const inv of open) {
     if (!inv.subscriptionId || inv.attemptCount < 1 || known.has(inv.id)) continue;
-    if (await emit(deps, tenantId, account, 'invoice.payment_failed', inv)) opened++;
+    // la liste n'expand pas le PaymentIntent (limite de profondeur Stripe) : on relit la facture pour le code et la date d'échec
+    const detailed = await deps.stripe.retrieveInvoice(account, inv.id);
+    if (await emit(deps, tenantId, account, 'invoice.payment_failed', detailed)) opened++;
   }
 
   let closed = 0;
-  const active = await deps.pool.query(
-    `select stripe_invoice_id from recovery_cases where tenant_id = $1 and state in ('OPEN','RECOVERING','PAUSED') order by failed_at limit 500`,
-    [tenantId],
-  );
-  for (const row of active.rows) {
-    const invoiceId = row.stripe_invoice_id as string;
-    if (openIds.has(invoiceId)) continue;
-    const inv = await deps.stripe.retrieveInvoice(account, invoiceId);
-    const type = inv.status === 'paid' ? 'invoice.paid' : inv.status === 'void' ? 'invoice.voided' : inv.status === 'uncollectible' ? 'invoice.marked_uncollectible' : null;
-    if (type && (await emit(deps, tenantId, account, type, inv))) closed++;
+  // Pagination par curseur (failed_at, id) : tous les dossiers actifs sont comparés à Stripe, pas seulement les plus anciens.
+  let cursor: { failedAt: Date; id: string } | null = null;
+  for (;;) {
+    const page: { rows: any[] } = await deps.pool.query(
+      `select id, failed_at, stripe_invoice_id from recovery_cases
+        where tenant_id = $1 and state in ('OPEN','RECOVERING','PAUSED')
+          and ($2::timestamptz is null or (failed_at, id) > ($2::timestamptz, $3::uuid))
+        order by failed_at, id limit $4`,
+      [tenantId, cursor?.failedAt ?? null, cursor?.id ?? null, PAGE_SIZE],
+    );
+    for (const row of page.rows) {
+      const invoiceId = row.stripe_invoice_id as string;
+      if (openIds.has(invoiceId)) continue;
+      const inv = await deps.stripe.retrieveInvoice(account, invoiceId);
+      const type = inv.status === 'paid' ? 'invoice.paid' : inv.status === 'void' ? 'invoice.voided' : inv.status === 'uncollectible' ? 'invoice.marked_uncollectible' : null;
+      if (type && (await emit(deps, tenantId, account, type, inv))) closed++;
+    }
+    if (page.rows.length < PAGE_SIZE) break;
+    const last = page.rows[page.rows.length - 1];
+    cursor = { failedAt: last.failed_at, id: last.id };
   }
   return { opened, closed };
 }

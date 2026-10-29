@@ -58,6 +58,36 @@ describe('ResendMailer', () => {
     expect(err.permanent).toBe(true);
   });
 
+  it('400 = permanente aussi', async () => {
+    const { baseUrl } = await start(() => ({ status: 400, json: { message: 'bad' } }));
+    const err = await new ResendMailer({ apiKey: 'k', baseUrl }).send(email).catch((e) => e);
+    expect(err.permanent).toBe(true);
+  });
+
+  it('401, 403, 404, 408, 409, 429 et 5xx = temporaires (clé ou domaine à corriger, pas un échec définitif)', async () => {
+    for (const status of [401, 403, 404, 408, 409, 429, 500, 503]) {
+      const { baseUrl } = await start(() => ({ status, json: { message: 'oops' } }));
+      const err = await new ResendMailer({ apiKey: 'k', baseUrl }).send(email).catch((e) => e);
+      expect(err, String(status)).toBeInstanceOf(MailerError);
+      expect(err.permanent, String(status)).toBe(false);
+      server!.close();
+    }
+  });
+
+  it('délai maximal : un serveur muet donne une erreur temporaire', async () => {
+    server = createServer(() => {});
+    await new Promise<void>((r) => server!.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    const t0 = Date.now();
+    const err = await new ResendMailer({ apiKey: 'k', baseUrl: `http://127.0.0.1:${port}`, timeoutMs: 200 })
+      .send(email)
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(MailerError);
+    expect(err.permanent).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(3000);
+    server.closeAllConnections();
+  });
+
   it('429 et 5xx = temporaires', async () => {
     for (const status of [429, 500, 503]) {
       const { baseUrl } = await start(() => ({ status, json: { message: 'oops' } }));

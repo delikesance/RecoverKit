@@ -10,7 +10,7 @@ import {
   Money,
 } from '@recoverkit/core';
 import { insertLedgerEntry, logAction, mapCase, type CaseRow, type Queryable } from '@recoverkit/db';
-import type { InvoiceData } from '@recoverkit/stripe';
+import { GatewayError, type InvoiceData, type PayResult } from '@recoverkit/stripe';
 import type { Deps } from '../deps';
 
 export interface TenantRow {
@@ -107,7 +107,7 @@ export async function closeCase(
     [c.id, next, now, reason],
   );
   await db.query(
-    `update scheduled_steps set status = 'CANCELED', skip_reason = $2 where case_id = $1 and status = 'SCHEDULED'`,
+    `update scheduled_steps set status = 'CANCELED', skip_reason = $2 where case_id = $1 and status in ('SCHEDULED','SENDING')`,
     [c.id, reason],
   );
   await db.query(`update payment_tokens set revoked_at = $2 where case_id = $1 and revoked_at is null and used_at is null`, [c.id, now]);
@@ -131,7 +131,8 @@ export async function recordRecovery(
   inv: InvoiceData,
   eventId: string | null,
 ): Promise<'recorded' | 'already_closed'> {
-  if (['RECOVERED', 'CANCELED', 'LOST', 'CLOSED_MANUAL'].includes(c.state)) return 'already_closed';
+  if (c.state === 'RECOVERED') return 'already_closed';
+  const closed = ['CANCELED', 'LOST', 'CLOSED_MANUAL'].includes(c.state);
 
   const paidAt = inv.paidAt ?? deps.clock.now();
   const link = await db.query(`select min(created_at) as at from payment_attempts where case_id = $1 and source = 'link'`, [c.id]);
@@ -141,7 +142,8 @@ export async function recordRecovery(
     linkUsedAt: link.rows[0]?.at ?? null,
   });
 
-  await closeCase(deps, db, c, 'PAID', 'paid');
+  // Dossier déjà clos (LOST, CLOSED_MANUAL, CANCELED) : on comptabilise le paiement sans rouvrir l'état.
+  if (!closed) await closeCase(deps, db, c, 'PAID', 'paid');
   if (inv.amountPaid > 0) {
     const entry = buildRecoveryEntry({
       caseId: c.id,
@@ -152,7 +154,7 @@ export async function recordRecovery(
       paidAt,
       attribution,
     });
-    await insertLedgerEntry(db, {
+    const inserted = await insertLedgerEntry(db, {
       tenantId: c.tenantId,
       caseId: c.id,
       invoiceId: c.stripeInvoiceId,
@@ -164,6 +166,8 @@ export async function recordRecovery(
       stripeEventId: eventId,
       ruleVersion: ATTRIBUTION_RULE_VERSION,
     });
+    // Écriture déjà présente (rejeu, second évènement) : rien de nouveau à auditer.
+    if (inserted !== 'inserted') return 'already_closed';
     await logAction(db, {
       tenantId: c.tenantId,
       caseId: c.id,
@@ -171,6 +175,15 @@ export async function recordRecovery(
       action: 'ledger.recorded',
       details: { attribution, amount: entry.amount.amount, currency: entry.amount.currency },
     });
+    if (closed) {
+      await logAction(db, {
+        tenantId: c.tenantId,
+        caseId: c.id,
+        actor: 'stripe',
+        action: 'case.paid_after_close',
+        details: { state: c.state, attribution, amount: entry.amount.amount },
+      });
+    }
   }
   return 'recorded';
 }
@@ -190,7 +203,13 @@ export async function reverseRecovery(
     [tenantId, invoiceId],
   );
   const base = rows.rows.find((r) => r.kind === 'RECOVERY');
-  if (!base) return 'no_recovery';
+  if (!base) {
+    // Dossier connu mais paiement pas encore comptabilisé (invoice.paid en backoff) : on reporte le
+    // remboursement, sinon il serait consommé puis le revenu écrit en entier.
+    const known = await db.query(`select 1 from recovery_cases where tenant_id = $1 and stripe_invoice_id = $2`, [tenantId, invoiceId]);
+    if ((known.rowCount ?? 0) > 0) throw new Error(`remboursement/litige reporté : pas encore de ligne RECOVERY pour ${invoiceId}`);
+    return 'no_recovery';
+  }
   const already = -rows.rows.filter((r) => r.kind === 'ADJUSTMENT').reduce((n, r) => n + Number(r.amount), 0);
   const original: LedgerEntry = {
     caseId: base.case_id,
@@ -221,7 +240,7 @@ export async function reverseRecovery(
   return 'adjusted';
 }
 
-export type AttemptOutcome = 'skipped_dry_run' | 'already_attempted' | 'paid' | 'failed' | 'requires_action';
+export type AttemptOutcome = 'skipped_dry_run' | 'already_attempted' | 'already_paid' | 'paid' | 'failed' | 'requires_action' | 'processing';
 
 /** Une seule tentative de paiement par (dossier, moyen de paiement). */
 export async function attemptPayment(
@@ -244,11 +263,24 @@ export async function attemptPayment(
   );
   if (inserted.rowCount !== 1) return 'already_attempted';
 
-  const result = await deps.stripe.payInvoice(account, c.stripeInvoiceId, {
-    paymentMethodId,
-    idempotencyKey: `retry:${c.id}:${paymentMethodId}`,
-  });
-  const status = result.status === 'paid' ? 'SUCCEEDED' : result.status === 'failed' ? 'FAILED' : 'REQUIRES_ACTION';
+  let result: PayResult;
+  try {
+    result = await deps.stripe.payInvoice(account, c.stripeInvoiceId, {
+      paymentMethodId,
+      idempotencyKey: `retry:${c.id}:${paymentMethodId}`,
+    });
+  } catch (e) {
+    // Facture déjà payée côté Stripe (Smart Retries, facture hébergée) : pas un échec, invoice.paid fait la clôture.
+    if (!(e instanceof GatewayError) || e.kind !== 'invalid_request') throw e;
+    const inv = await deps.stripe.retrieveInvoice(account, c.stripeInvoiceId);
+    if (inv.status !== 'paid') throw e;
+    await db.query(`delete from payment_attempts where id = $1`, [inserted.rows[0].id]);
+    await logAction(db, { tenantId: c.tenantId, caseId: c.id, actor: 'system', action: 'retry.already_paid', details: { paymentMethodId, source } });
+    return 'already_paid';
+  }
+  // 'processing' (SEPA) : la tentative reste PENDING, invoice.paid / invoice.payment_failed concluront.
+  const status =
+    result.status === 'paid' ? 'SUCCEEDED' : result.status === 'failed' ? 'FAILED' : result.status === 'processing' ? 'PENDING' : 'REQUIRES_ACTION';
   await db.query(`update payment_attempts set status = $2, error_code = $3 where id = $1`, [
     inserted.rows[0].id,
     status,

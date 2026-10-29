@@ -74,11 +74,11 @@ describe('réception des webhooks Stripe', () => {
     expect(row.rows[0].status).toBe('ignored');
   });
 
-  it('répond vite : le traitement n’a pas lieu dans la requête', async () => {
+  it('le traitement n’a pas lieu dans la requête : aucun dossier créé à la réception', async () => {
     const evt = stripeEvent('invoice.payment_failed', { id: 'in_fast' }, { account: 'acct_known', id: 'evt_fast' });
-    const t0 = Date.now();
     await receiveStripeWebhook(deps, req(evt));
-    expect(Date.now() - t0).toBeLessThan(500);
+    const stored = await db.pool.query(`select status from inbox_events where stripe_event_id = 'evt_fast'`);
+    expect(stored.rows[0].status).toBe('pending');
     const cases = await db.pool.query(`select count(*)::int n from recovery_cases where tenant_id = $1`, [tenantId]);
     expect(cases.rows[0].n).toBe(0);
   });

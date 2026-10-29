@@ -1,4 +1,4 @@
-import { nextWindowInstant, partsInZone, transitionCase, MIN_GAP_MS } from '@recoverkit/core';
+import { currencyDigits, nextWindowInstant, partsInZone, transitionCase, MIN_GAP_MS } from '@recoverkit/core';
 import { logAction, mapCase, withTransaction, type CaseRow, type Queryable } from '@recoverkit/db';
 import type { Deps } from '../deps';
 import { closeCase, loadTenant, lockTenant, type TenantRow } from '../recovery/ops';
@@ -30,7 +30,7 @@ export async function pauseCase(deps: Deps, tenantId: string, caseId: string, ac
   });
 }
 
-/** Reprise : les étapes échues sont replanifiées dans la fenêtre d'envoi, avec l'écart minimal entre emails. */
+/** Reprise : les étapes échues sont replanifiées dans la fenêtre d'envoi, et les suivantes repoussées au besoin pour garder l'écart minimal entre emails. */
 export async function resumeCase(deps: Deps, tenantId: string, caseId: string, actor: string): Promise<Base> {
   return withCase(deps, tenantId, caseId, async (tx, c, tenant): Promise<Base> => {
     if (c.state !== 'PAUSED') return { status: 'invalid_state' };
@@ -44,14 +44,10 @@ export async function resumeCase(deps: Deps, tenantId: string, caseId: string, a
     let previous: number | null = lastSent.rows[0]?.at ? new Date(lastSent.rows[0].at).getTime() : null;
     for (const s of pending.rows) {
       const original = new Date(s.due_at).getTime();
-      if (original > now.getTime()) {
-        previous = original;
-        continue;
-      }
-      let candidate = now.getTime();
+      let candidate = Math.max(original, now.getTime());
       if (previous !== null) candidate = Math.max(candidate, previous + MIN_GAP_MS);
       const due = nextWindowInstant(new Date(candidate), window);
-      await tx.query(`update scheduled_steps set due_at = $2 where id = $1`, [s.id, due]);
+      if (due.getTime() !== original) await tx.query(`update scheduled_steps set due_at = $2 where id = $1`, [s.id, due]);
       previous = due.getTime();
     }
     await tx.query(`update recovery_cases set state = $2, updated_at = $3 where id = $1`, [c.id, transitionCase('PAUSED', 'RESUME'), now]);
@@ -117,7 +113,7 @@ export async function* exportRecoveredCsv(deps: Deps, tenantId: string, period: 
     for (const r of rows) {
       const p = partsInZone(r.occurredAt, tenant.timeZone);
       const date = `${p.y}-${String(p.m).padStart(2, '0')}-${String(p.d).padStart(2, '0')} ${String(p.h).padStart(2, '0')}:${String(p.min).padStart(2, '0')}`;
-      const digits = new Intl.NumberFormat('en', { style: 'currency', currency: r.currency }).resolvedOptions().maximumFractionDigits ?? 2;
+      const digits = currencyDigits(r.currency);
       const amount = (r.amount / 10 ** digits).toFixed(digits).replace('.', ',');
       const attribution = r.attribution === 'ASSISTED' ? 'Récupéré' : 'Payé avant relance (non compté)';
       chunk +=

@@ -115,16 +115,16 @@ export function LandingView({ plans, trialDays }: { plans: PlanView[]; trialDays
           <Calculator />
         </Section>
 
-        <Section id="tarifs" title="Un tarif qui se rembourse tout seul" tint>
+        <Section id="tarifs" title="Un tarif fixe, sans commission sur le récupéré" tint>
           <p className="m-lead" style={{ marginBottom: 32 }}>Essayez RecoverKit gratuitement pendant {trialDays} jours, sans engagement.</p>
           {plans.length > 0 ? (
             <div className="kpis">
-              {plans.map((p, i) => (
-                <div key={p.key} className="panel stack" style={{ flex: '1 1 280px', padding: 32, gap: 12, border: i === Math.min(1, plans.length - 1) && plans.length > 1 ? '2px solid var(--blue)' : undefined }}>
-                  <div className="row" style={{ justifyContent: 'space-between' }}><b>{p.name}</b>{i === 1 ? <span className="chip chip-info">Le plus choisi</span> : null}</div>
+              {plans.map((p) => (
+                <div key={p.key} className="panel stack" style={{ flex: '1 1 280px', padding: 32, gap: 12 }}>
+                  <div className="row" style={{ justifyContent: 'space-between' }}><b>{p.name}</b></div>
                   <div className="num m-price">{euros(p.monthlyPrice)}<span className="muted" style={{ fontSize: 16, fontWeight: 500, letterSpacing: 0 }}> par mois</span></div>
                   <p className="muted" style={{ flex: 1 }}>{p.maxMrr === null ? 'Sans limite de revenu mensuel récurrent' : `Jusqu’à ${euros(p.maxMrr)} de revenu mensuel récurrent`}</p>
-                  <a href="/login" className={`btn ${i === 1 ? 'btn-p' : 'btn-s'}`}>Commencer</a>
+                  <a href="/login" className="btn btn-p">Commencer</a>
                 </div>
               ))}
             </div>

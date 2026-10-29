@@ -8,7 +8,7 @@ import { Chip } from '@/ui/Chip';
 import { Flash } from '@/ui/Flash';
 import { Timeline } from '@/ui/Timeline';
 import { IconBack } from '@/ui/icons';
-import { failureLabel, formatDateTime, formatMoney, stateLabel } from '@/lib/format';
+import { failureLabel, formatDateTime, formatMoney, invoiceChip, stateLabel } from '@/lib/format';
 import { closeCaseAction, pauseCaseAction, resumeCaseAction, sendNowAction } from '../../actions';
 
 export const metadata: Metadata = { title: 'Détail du paiement' };
@@ -21,8 +21,9 @@ export default async function CaseDetailPage({ params, searchParams }: { params:
   const detail = /^[0-9a-f-]{36}$/i.test(id) ? await getCaseDetail(ctx.deps, ctx.tenant.id, id) : null;
   if (!detail) notFound();
   const c = detail.case;
-  const state = stateLabel(c.state);
+  const state = stateLabel(c.state, detail.attribution);
   const active = ['RECOVERING', 'PAUSED', 'OPEN'].includes(c.state);
+  const invoice = invoiceChip(c.state);
   const name = detail.customer?.name ?? 'Client inconnu';
   const upcoming = detail.steps.filter((s) => s.status === 'SCHEDULED').slice(0, 1).map((s) => ({ label: s.stepIndex === Math.max(...detail.steps.map((x) => x.stepIndex)) ? 'Dernier avis planifié' : `Email ${s.stepIndex + 1} planifié`, at: s.dueAt }));
 
@@ -78,7 +79,7 @@ export default async function CaseDetailPage({ params, searchParams }: { params:
         <section className="panel col-main" style={{ padding: 28 }} aria-labelledby="h-histo">
           <h2 id="h-histo" className="section-title">Historique des relances</h2>
           <p className="muted" style={{ fontSize: 14, margin: '4px 0 24px' }}>Chaque action est enregistrée. Aucun email n’est envoyé deux fois pour le même échec.</p>
-          <Timeline events={detail.timeline} timeZone={ctx.tenant.timeZone} upcoming={active ? upcoming : []} />
+          <Timeline events={detail.timeline} timeZone={ctx.tenant.timeZone} upcoming={active ? upcoming : []} attribution={detail.attribution} />
           {detail.emails.length > 0 ? (
             <div style={{ marginTop: 28 }}>
               <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>Emails envoyés</h3>
@@ -98,7 +99,7 @@ export default async function CaseDetailPage({ params, searchParams }: { params:
           <section className="panel" style={{ padding: 24 }} aria-labelledby="h-facture">
             <div className="row" style={{ justifyContent: 'space-between', marginBottom: 12 }}>
               <h2 id="h-facture" style={{ fontSize: 16, fontWeight: 600 }}>Facture</h2>
-              <Chip tone={c.state === 'RECOVERED' ? 'success' : 'warning'}>{c.state === 'RECOVERED' ? 'Payée' : 'Impayée'}</Chip>
+              <Chip tone={invoice.tone}>{invoice.label}</Chip>
             </div>
             <div className="kpi-value num" style={{ marginTop: 0, marginBottom: 12 }}>{formatMoney(c.amountDue, c.currency)}</div>
             <div className="kv"><span>Identifiant</span><b style={{ fontWeight: 600 }}>{c.stripeInvoiceId}</b></div>
@@ -106,10 +107,12 @@ export default async function CaseDetailPage({ params, searchParams }: { params:
             <div className="kv"><span>Motif du refus</span><b style={{ fontWeight: 600 }}>{failureLabel(c.lastFailureCode)}</b></div>
             <a className="btn btn-s" href={detail.stripeInvoiceUrl} rel="noreferrer" target="_blank" style={{ width: '100%', marginTop: 8 }}>Ouvrir dans Stripe</a>
           </section>
-          <section className="panel" style={{ padding: 24, background: 'var(--green-tint)', borderColor: '#b7e4cf' }}>
-            <h2 style={{ fontSize: 16, fontWeight: 600, color: '#0b6b4a', marginBottom: 6 }}>Si le paiement aboutit</h2>
-            <p style={{ color: '#145c41', fontSize: 15 }}>Il sera compté comme récupéré si au moins un email est parti avant. Le montant vient directement de la facture Stripe.</p>
-          </section>
+          {active ? (
+            <section className="panel" style={{ padding: 24, background: 'var(--green-tint)', borderColor: '#b7e4cf' }}>
+              <h2 style={{ fontSize: 16, fontWeight: 600, color: '#0b6b4a', marginBottom: 6 }}>Si le paiement aboutit</h2>
+              <p style={{ color: '#145c41', fontSize: 15 }}>Il sera compté comme récupéré si au moins un email est parti avant. Le montant vient directement de la facture Stripe.</p>
+            </section>
+          ) : null}
         </div>
       </div>
     </AppShell>

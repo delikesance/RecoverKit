@@ -3,6 +3,7 @@ import { headers } from 'next/headers';
 import { cardErrorMessage, confirmSetup, payMessage, resolvePaymentLink, type PayLocale } from '@recoverkit/services';
 import { PayCard } from '@/ui/pay/PayCard';
 import { getDeps } from '@/server/runtime';
+import { clientIp } from '@/server/http';
 
 export const metadata: Metadata = { title: 'Paiement', robots: { index: false, follow: false } };
 export const dynamic = 'force-dynamic';
@@ -12,7 +13,7 @@ export default async function PayReturnPage({ params, searchParams }: { params: 
   const sp = await searchParams;
   const deps = getDeps();
   const h = await headers();
-  const ip = h.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+  const ip = clientIp(h, deps.config.trustedProxyHops);
 
   const link = await resolvePaymentLink(deps, token, { ip });
   const locale: PayLocale = link.status === 'ok' ? link.view.locale : 'fr';

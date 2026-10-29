@@ -62,6 +62,44 @@ describe('expéditeur personnalisé', () => {
     expect(await tenantRow(t.id)).toMatchObject({ sender_domain: 'two.example', sender_verified: false });
   });
 
+  it('même domaine déjà vérifié : le statut renvoyé est « verified », pas « pending »', async () => {
+    const deps = makeDeps(db);
+    const t = await seedTenant(db.pool);
+    await configureSender(deps, t.id, { email: 'contact@verif.example', name: 'A' });
+    deps.domains.markVerified((await tenantRow(t.id)).sender_domain_id);
+    await checkSenderDomain(deps, t.id);
+    const r = await configureSender(deps, t.id, { email: 'factures@verif.example', name: 'A' });
+    expect(r.status).toBe('verified');
+    expect(await tenantRow(t.id)).toMatchObject({ sender_email: 'factures@verif.example', sender_verified: true });
+  });
+
+  it('changement de domaine : le nouveau est créé AVANT de supprimer l’ancien', async () => {
+    const deps = makeDeps(db);
+    const t = await seedTenant(db.pool);
+    await configureSender(deps, t.id, { email: 'a@one.example', name: 'A' });
+    const calls: string[] = [];
+    const create = deps.domains.createDomain.bind(deps.domains);
+    const del = deps.domains.deleteDomain.bind(deps.domains);
+    deps.domains.createDomain = async (n: string) => (calls.push('create'), create(n));
+    deps.domains.deleteDomain = async (id: string) => (calls.push('delete'), del(id));
+    await configureSender(deps, t.id, { email: 'a@two.example', name: 'A' });
+    expect(calls).toEqual(['create', 'delete']);
+  });
+
+  it('si la création du nouveau domaine échoue, l’ancien n’est pas supprimé et la base reste cohérente', async () => {
+    const deps = makeDeps(db);
+    const t = await seedTenant(db.pool);
+    await configureSender(deps, t.id, { email: 'a@one.example', name: 'A' });
+    const first = (await tenantRow(t.id)).sender_domain_id;
+    deps.domains.createDomain = async () => {
+      throw new Error('Resend a répondu 503');
+    };
+    await expect(configureSender(deps, t.id, { email: 'a@two.example', name: 'A' })).rejects.toThrow(/503/);
+    expect(deps.domains.deleted).not.toContain(first);
+    expect(await tenantRow(t.id)).toMatchObject({ sender_domain: 'one.example', sender_domain_id: first });
+    expect((await checkSenderDomain(deps, t.id)).status).toBe('pending');
+  });
+
   it('tant que le domaine n’est pas vérifié, il reste en attente ; une fois vérifié, il est actif', async () => {
     const deps = makeDeps(db);
     const t = await seedTenant(db.pool);
@@ -84,6 +122,27 @@ describe('expéditeur personnalisé', () => {
     await checkSenderDomain(deps, t.id);
     const alerts = await db.pool.query(`select kind from system_alerts where tenant_id = $1 and resolved_at is null`, [t.id]);
     expect(alerts.rows).toEqual([{ kind: 'sender_domain_failed' }]);
+  });
+
+  it('domaine vérifié ou supprimé : l’alerte sender_domain_failed est résolue', async () => {
+    const deps = makeDeps(db);
+    const open = async (id: string) => (await db.pool.query(`select count(*)::int n from system_alerts where tenant_id = $1 and kind = 'sender_domain_failed' and resolved_at is null`, [id])).rows[0].n;
+    const t = await seedTenant(db.pool);
+    await configureSender(deps, t.id, { email: 'a@nimbusnotes.example', name: 'A' });
+    deps.domains.markFailed((await tenantRow(t.id)).sender_domain_id);
+    await checkSenderDomain(deps, t.id);
+    expect(await open(t.id)).toBe(1);
+    deps.domains.markVerified((await tenantRow(t.id)).sender_domain_id);
+    await checkSenderDomain(deps, t.id);
+    expect(await open(t.id)).toBe(0);
+
+    const t2 = await seedTenant(db.pool);
+    await configureSender(deps, t2.id, { email: 'a@autre.example', name: 'A' });
+    deps.domains.markFailed((await tenantRow(t2.id)).sender_domain_id);
+    await checkSenderDomain(deps, t2.id);
+    expect(await open(t2.id)).toBe(1);
+    await removeSender(deps, t2.id);
+    expect(await open(t2.id)).toBe(0);
   });
 
   it('sans configuration : « none » ; suppression : retour à l’expéditeur par défaut', async () => {

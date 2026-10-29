@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Money, evaluateToken, hashToken } from '@recoverkit/core';
-import { findPaymentTokenByHash, hitRateLimit, mapCase, withTransaction, type CaseRow, type PaymentTokenRow } from '@recoverkit/db';
+import { findPaymentTokenByHash, hitRateLimit, logAction, mapCase, withTransaction, type CaseRow, type PaymentTokenRow } from '@recoverkit/db';
 import { GatewayError } from '@recoverkit/stripe';
 import type { Deps } from '../deps';
 import { attemptPayment, loadTenant, lockTenant, type TenantRow } from '../recovery/ops';
@@ -133,12 +133,22 @@ export async function confirmSetup(
       if (outcome === 'skipped_dry_run') return { status: 'dry_run' };
 
       const att = await tx.query(`select status, error_code from payment_attempts where case_id = $1 and payment_method_id = $2`, [c.id, pm]);
+      if (outcome === 'already_paid') {
+        // Payée côté Stripe entre-temps : pas de débit de notre part, le lien est consommé, invoice.paid clôture.
+        await tx.query(`update payment_tokens set used_at = $2 where id = $1 and used_at is null`, [r.token.id, deps.clock.now()]);
+        return { status: 'paid' };
+      }
       const status = outcome === 'already_attempted' ? (att.rows[0]?.status as string) : outcome;
       if (status === 'paid' || status === 'SUCCEEDED') {
         await tx.query(`update payment_tokens set used_at = $2 where id = $1 and used_at is null`, [r.token.id, deps.clock.now()]);
         return { status: 'paid' };
       }
       if (status === 'failed' || status === 'FAILED') return { status: 'card_failed', errorCode: att.rows[0]?.error_code ?? 'card_declined' };
+      if (status === 'processing' || status === 'PENDING') {
+        // Paiement asynchrone en cours : le lien n'est pas consommé, invoice.paid conclura.
+        await logAction(tx, { tenantId: c.tenantId, caseId: c.id, actor: 'customer', action: 'payment.processing', details: { paymentMethodId: pm } });
+        return { status: 'processing' };
+      }
       if (status === 'requires_action' || status === 'REQUIRES_ACTION') {
         const inv = await deps.stripe.retrieveInvoice(account, c.stripeInvoiceId);
         return { status: 'requires_action', hostedInvoiceUrl: inv.hostedInvoiceUrl ?? null };

@@ -69,26 +69,33 @@ export class FakeDomainProvider implements DomainProvider {
 
 export class ResendDomainProvider implements DomainProvider {
   private readonly baseUrl: string;
-  constructor(private readonly opts: { apiKey: string; baseUrl?: string }) {
+  constructor(private readonly opts: { apiKey: string; baseUrl?: string; timeoutMs?: number }) {
     this.baseUrl = opts.baseUrl ?? 'https://api.resend.com';
   }
 
-  private async call(method: string, path: string, body?: unknown): Promise<any> {
+  private async call(method: string, path: string, body?: unknown, parse = true): Promise<any> {
     let res: Response;
     try {
       res = await fetch(`${this.baseUrl}${path}`, {
         method,
         headers: { authorization: `Bearer ${this.opts.apiKey}`, 'content-type': 'application/json' },
         body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(this.opts.timeoutMs ?? 15_000),
       });
     } catch (e) {
       throw new MailerError(`Erreur réseau : ${(e as Error).message}`, { permanent: false });
     }
     if (!res.ok) {
-      const permanent = res.status >= 400 && res.status < 500 && res.status !== 429 && res.status !== 408;
+      // Seuls 400/422 (requête invalide) sont définitifs ; 401/403/409/429/5xx se corrigent et se rejouent
+      const permanent = res.status === 400 || res.status === 422;
       throw new MailerError(`Resend a répondu ${res.status}`, { permanent });
     }
-    return res.json();
+    if (!parse) return undefined;
+    try {
+      return await res.json();
+    } catch (e) {
+      throw new MailerError(`Réponse Resend illisible : ${(e as Error).message}`, { permanent: false });
+    }
   }
 
   private map(d: any): SenderDomain {
@@ -111,9 +118,9 @@ export class ResendDomainProvider implements DomainProvider {
     return this.map(await this.call('GET', `/domains/${id}`));
   }
   async verifyDomain(id: string): Promise<void> {
-    await this.call('POST', `/domains/${id}/verify`);
+    await this.call('POST', `/domains/${id}/verify`, undefined, false);
   }
   async deleteDomain(id: string): Promise<void> {
-    await this.call('DELETE', `/domains/${id}`);
+    await this.call('DELETE', `/domains/${id}`, undefined, false);
   }
 }

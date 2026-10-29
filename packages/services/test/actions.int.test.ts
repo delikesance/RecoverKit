@@ -63,6 +63,23 @@ describe('pause et reprise', () => {
   });
 });
 
+describe('reprise : écart minimal aussi pour les étapes futures', () => {
+  it('une étape future trop proche de l’étape replanifiée est repoussée (≥ 12 h, dans la fenêtre)', async () => {
+    const now = new Date('2026-10-28T18:30:00Z'); // 19h30 Paris, hors fenêtre
+    const deps = makeDeps(db, now);
+    const { t, c } = await openCase('PAUSED');
+    await seedStep(db.pool, c.id, t.id, { stepIndex: 0, dueAt: new Date('2026-10-27T09:00:00Z') });
+    await seedStep(db.pool, c.id, t.id, { stepIndex: 1, dueAt: new Date('2026-10-29T09:00:00Z') });
+    await seedStep(db.pool, c.id, t.id, { stepIndex: 2, dueAt: new Date('2026-11-20T09:00:00Z') });
+    expect(await resumeCase(deps, t.id, c.id, actor)).toEqual({ status: 'ok' });
+    const due = (await steps(c.id)).map((x) => new Date(x.due_at).getTime());
+    expect(new Date(due[0]!).toISOString()).toBe('2026-10-29T08:00:00.000Z');
+    expect(due[1]! - due[0]!).toBeGreaterThanOrEqual(12 * 3600_000);
+    expect(new Date(due[1]!).toISOString()).toBe('2026-10-30T08:00:00.000Z');
+    expect(due[2]).toBe(new Date('2026-11-20T09:00:00Z').getTime()); // assez loin : inchangée
+  });
+});
+
 describe('envoyer le prochain email maintenant', () => {
   it('avance la prochaine étape à maintenant, une seule fois', async () => {
     const deps = makeDeps(db, NOW);

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createTestDb, type TestDb } from '@recoverkit/testkit';
 import { consumeLoginLink, getSession, requestLoginLink, revokeSession } from '../src/auth/auth';
+import { DEFAULT_TENANT_NAME } from '../src/settings/general';
 import { makeDeps, type TestDeps } from './helpers';
 
 let db: TestDb;
@@ -71,8 +72,8 @@ describe('connexion par lien magique', () => {
     expect(seq.rows).toHaveLength(1);
     expect(seq.rows[0].version).toBe(1);
     expect(seq.rows[0].steps).toHaveLength(4);
-    const tenant = await db.pool.query(`select dry_run, emails_enabled from tenants where id = $1`, [out.tenantId]);
-    expect(tenant.rows[0]).toEqual({ dry_run: true, emails_enabled: true });
+    const tenant = await db.pool.query(`select name, dry_run, emails_enabled from tenants where id = $1`, [out.tenantId]);
+    expect(tenant.rows[0]).toEqual({ name: DEFAULT_TENANT_NAME, dry_run: true, emails_enabled: true });
   });
 
   it('un second login retrouve le même tenant', async () => {

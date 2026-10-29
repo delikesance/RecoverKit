@@ -5,6 +5,7 @@ import { loadAppContext } from '@/server/context';
 import { AppShell } from '@/ui/AppShell';
 import { Banners } from '@/ui/Banners';
 import { Chip } from '@/ui/Chip';
+import { parsePeriod } from '@/lib/period';
 import { formatDateTime, formatMoney, monthLabel } from '@/lib/format';
 
 export const metadata: Metadata = { title: 'Paiements récupérés' };
@@ -14,8 +15,7 @@ export default async function RecoveredPage({ searchParams }: { searchParams: Pr
   const sp = await searchParams;
   const ctx = await loadAppContext();
   const nowLocal = partsInZone(ctx.now, ctx.tenant.timeZone);
-  const year = Number(sp.year) >= 2000 ? Number(sp.year) : nowLocal.y;
-  const month = Number(sp.month) >= 1 && Number(sp.month) <= 12 ? Number(sp.month) : nowLocal.m;
+  const { year, month } = parsePeriod(sp, nowLocal);
   const page = Math.max(Number(sp.page) || 1, 1);
   const r = await listRecovered(ctx.deps, ctx.tenant.id, { year, month, page, pageSize: 50 });
   const prev = new Date(Date.UTC(year, month - 2, 1));
@@ -49,7 +49,7 @@ export default async function RecoveredPage({ searchParams }: { searchParams: Pr
                     <td className="muted">{formatDateTime(row.occurredAt, ctx.tenant.timeZone)}</td>
                     <td style={{ fontWeight: 600 }}><a href={`/app/cases/${row.caseId}`}>{row.customerName ?? 'Client'}</a></td>
                     <td>{row.kind === 'RECOVERY' ? 'Récupération' : 'Ajustement'}</td>
-                    <td>{row.attribution === 'ASSISTED' ? <Chip tone="success">Récupéré</Chip> : <Chip tone="neutral">Payé avant relance (non compté)</Chip>}</td>
+                    <td>{row.attribution === 'ASSISTED' ? <Chip tone="success">Récupéré</Chip> : <Chip tone="neutral">Payé sans relance (non compté)</Chip>}</td>
                     <td className="right num" style={{ fontWeight: 600, color: row.amount < 0 ? 'var(--red)' : row.attribution === 'ASSISTED' ? 'var(--green)' : undefined }}>{formatMoney(row.amount, row.currency)}</td>
                     <td><a href={row.stripeInvoiceUrl} target="_blank" rel="noreferrer" style={{ textDecoration: 'underline' }}>{row.invoiceId}</a></td>
                   </tr>

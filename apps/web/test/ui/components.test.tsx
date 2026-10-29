@@ -138,7 +138,53 @@ describe('CasesTable', () => {
   });
 });
 
+describe('CasesTable : attribution et filtres', () => {
+  const recovered = { id: 'r1', customerName: 'Nora', customerEmail: null, amount: 2900, currency: 'EUR', state: 'RECOVERED', failureCode: null, attemptCount: 1, failedAt: new Date('2026-10-17T08:00:00Z'), daysSinceFailure: 11, stepsSent: 0, stepsTotal: 4, nextDueAt: null };
+  it('« Récupéré » seulement pour une attribution ASSISTED', () => {
+    render(<CasesTable rows={[{ ...recovered, id: 'a' }, { ...recovered, id: 'n', customerName: 'Paul' }]} now={NOW} timeZone="Europe/Paris" attributions={{ a: 'ASSISTED', n: 'NATURAL' }} />);
+    expect(screen.getByText('Récupéré')).toBeTruthy();
+    expect(screen.getByText('Payé sans relance (non compté)')).toBeTruthy();
+  });
+  it('sans attribution connue : jamais « Récupéré »', () => {
+    render(<CasesTable rows={[recovered]} now={NOW} timeZone="Europe/Paris" />);
+    expect(screen.queryByText('Récupéré')).toBeNull();
+    expect(screen.getByText('Payé (non compté)')).toBeTruthy();
+  });
+  it('état vide avec filtre actif : message exact et lien de réinitialisation', () => {
+    render(<CasesTable rows={[]} now={NOW} timeZone="Europe/Paris" filtered />);
+    expect(screen.getByText('Aucun dossier ne correspond à ces filtres.')).toBeTruthy();
+    expect(screen.queryByText(/Aucun paiement en cours de relance/)).toBeNull();
+    expect(screen.getByRole('link', { name: 'Réinitialiser les filtres' }).getAttribute('href')).toBe('/app/cases');
+  });
+});
+
+describe('Banners : emails désactivés', () => {
+  it('affiche la bannière emails_disabled avec son lien vers les réglages', () => {
+    render(<Banners alerts={[{ kind: 'emails_disabled', severity: 'warning', message: 'Les emails de relance sont désactivés.', href: '/app/settings' }]} />);
+    expect(screen.getByRole('link', { name: /désactivés/ }).getAttribute('href')).toBe('/app/settings');
+  });
+});
+
+describe('AppShell : navigation étroite', () => {
+  it('la navigation porte la classe repliable (défilement horizontal en dessous de 860 px)', () => {
+    render(<AppShell tenantName="N" active="dashboard" activeCases={0} stripe="ACTIVE" userEmail="a@b.c"><p>x</p></AppShell>);
+    const nav = screen.getByRole('navigation', { name: 'Principal' });
+    expect(nav.classList.contains('app-nav')).toBe(true);
+    expect(within(nav).getAllByRole('link')).toHaveLength(7);
+  });
+});
+
 describe('Timeline', () => {
+  it('« Payé sans relance » pour un paiement naturel, jamais « récupéré »', () => {
+    render(<Timeline timeZone="Europe/Paris" attribution="NATURAL" events={[{ action: 'case.recovered', actor: 'stripe', details: {}, at: new Date('2026-10-17T09:00:00Z') }]} />);
+    expect(screen.getByText('Payé sans relance (non compté)')).toBeTruthy();
+    expect(screen.queryByText('Paiement récupéré')).toBeNull();
+  });
+  it('« Paiement récupéré » pour une attribution ASSISTED', () => {
+    render(<Timeline timeZone="Europe/Paris" attribution="ASSISTED" events={[{ action: 'case.recovered', actor: 'stripe', details: {}, at: new Date('2026-10-17T09:00:00Z') }]} />);
+    expect(screen.getByText('Paiement récupéré')).toBeTruthy();
+  });
+
   it('liste les événements dans l’ordre, du plus récent au plus ancien', () => {
     render(
       <Timeline

@@ -92,6 +92,44 @@ describe('getDashboard', () => {
     expect(d.rate.byAmount).toBeCloseTo(3000 / 4000);
   });
 
+  it('mois ne contenant que des remboursements : taux par montant nul (pas 100 % ni > 100 %)', async () => {
+    const deps = makeDeps(db, NOW);
+    const t = await seedTenant(db.pool);
+    const c = await closedCase(t.id, 'RECOVERED', '2026-09-05T10:00:00Z');
+    await ledger(t.id, c.id, c.invoiceId, { attribution: 'ASSISTED', amount: 2900, at: '2026-09-05T10:00:00Z' });
+    await ledger(t.id, c.id, c.invoiceId, { kind: 'ADJUSTMENT', attribution: 'ASSISTED', amount: -2900, at: '2026-10-05T10:00:00Z' });
+    const d = await getDashboard(deps, t.id, { year: 2026, month: 10 });
+    expect(d.recovered).toBe(-2900);
+    expect(d.rate.byAmount).toBeNull();
+    await closedCase(t.id, 'LOST', '2026-10-09T10:00:00Z', { amount: 1000 });
+    const d2 = await getDashboard(deps, t.id, { year: 2026, month: 10 });
+    expect(d2.rate.byAmount).toBeNull();
+  });
+
+  it('taux par montant : numérateur = RECOVERY ASSISTED du mois, borné à [0,1]', async () => {
+    const deps = makeDeps(db, NOW);
+    const t = await seedTenant(db.pool);
+    const c = await closedCase(t.id, 'RECOVERED', '2026-10-05T10:00:00Z');
+    await ledger(t.id, c.id, c.invoiceId, { attribution: 'ASSISTED', amount: 3000, at: '2026-10-05T10:00:00Z' });
+    await ledger(t.id, c.id, c.invoiceId, { kind: 'ADJUSTMENT', attribution: 'ASSISTED', amount: -1000, at: '2026-10-06T10:00:00Z' });
+    const old = await closedCase(t.id, 'RECOVERED', '2026-09-05T10:00:00Z');
+    await ledger(t.id, old.id, old.invoiceId, { attribution: 'ASSISTED', amount: 500, at: '2026-09-05T10:00:00Z' });
+    await ledger(t.id, old.id, old.invoiceId, { kind: 'ADJUSTMENT', attribution: 'ASSISTED', amount: -500, at: '2026-10-07T10:00:00Z' });
+    await closedCase(t.id, 'LOST', '2026-10-09T10:00:00Z', { amount: 1000 });
+    const d = await getDashboard(deps, t.id, { year: 2026, month: 10 });
+    expect(d.rate.byAmount).toBeCloseTo(3000 / 4000);
+    expect(d.rate.byAmount!).toBeLessThanOrEqual(1);
+  });
+
+  it('atRisk est « à date » : indépendant du mois affiché, avec la date de référence', async () => {
+    const deps = makeDeps(db, NOW);
+    const t = await seedTenant(db.pool);
+    await seedCase(db.pool, t.id, { state: 'RECOVERING', amountDue: 4200 });
+    const d = await getDashboard(deps, t.id, { year: 2026, month: 3 });
+    expect(d.atRisk).toMatchObject({ amount: 4200, count: 1 });
+    expect(d.atRiskAsOf).toEqual(NOW);
+  });
+
   it('série cumulée par jour : plateau entre les paiements, jusqu’à aujourd’hui', async () => {
     const deps = makeDeps(db, NOW);
     const t = await seedTenant(db.pool);
@@ -141,6 +179,18 @@ describe('getDashboard', () => {
     const d = await getDashboard(deps, t.id, { year: 2026, month: 10 });
     expect(d.recent).toHaveLength(1);
     expect(d.recent[0]).toMatchObject({ customerName: 'Léa Martin', amount: 2900, currency: 'EUR', attribution: 'ASSISTED', afterEmail: 2 });
+  });
+
+  it('dernières récupérations : seuls les emails SENT/DELIVERED comptent (pas les rebonds ni plaintes)', async () => {
+    const deps = makeDeps(db, NOW);
+    const t = await seedTenant(db.pool);
+    const c = await closedCase(t.id, 'RECOVERED', '2026-10-05T10:00:00Z');
+    for (const [i, status, at] of [[0, 'BOUNCED', '2026-10-01T09:00:00Z'], [1, 'COMPLAINED', '2026-10-02T09:00:00Z'], [2, 'DELIVERED', '2026-10-03T09:00:00Z'], [3, 'SENT', '2026-10-04T09:00:00Z']] as const) {
+      await db.pool.query(`insert into email_messages (tenant_id, case_id, step_index, idempotency_key, to_email, subject, sent_at, status) values ($1,$2,$3,$4,'x@example.com','s',$5,$6)`, [t.id, c.id, i, `${c.id}:${i}`, new Date(at), status]);
+    }
+    await ledger(t.id, c.id, c.invoiceId, { attribution: 'ASSISTED', amount: 2900, at: '2026-10-05T10:00:00Z' });
+    const d = await getDashboard(deps, t.id, { year: 2026, month: 10 });
+    expect(d.recent[0]!.afterEmail).toBe(2);
   });
 
   it('isolation : un tenant ne voit jamais les données d’un autre', async () => {
@@ -246,6 +296,19 @@ describe('getCaseDetail', () => {
     expect(d!.stripeInvoiceUrl).toContain(c.invoiceId);
   });
 
+  it('expose l’attribution du ledger : ASSISTED, NATURAL ou aucune', async () => {
+    const deps = makeDeps(db, NOW);
+    const t = await seedTenant(db.pool);
+    const a = await seedCase(db.pool, t.id, { state: 'RECOVERED' });
+    const n = await seedCase(db.pool, t.id, { state: 'RECOVERED' });
+    const none = await seedCase(db.pool, t.id, { state: 'RECOVERING' });
+    await ledger(t.id, a.id, a.invoiceId, { attribution: 'ASSISTED', amount: 2900, at: '2026-10-05T10:00:00Z' });
+    await ledger(t.id, n.id, n.invoiceId, { attribution: 'NATURAL', amount: 2900, at: '2026-10-05T10:00:00Z' });
+    expect((await getCaseDetail(deps, t.id, a.id))!.attribution).toBe('ASSISTED');
+    expect((await getCaseDetail(deps, t.id, n.id))!.attribution).toBe('NATURAL');
+    expect((await getCaseDetail(deps, t.id, none.id))!.attribution).toBeNull();
+  });
+
   it('renvoie null pour un dossier d’un autre tenant', async () => {
     const deps = makeDeps(db, NOW);
     const a = await seedTenant(db.pool);
@@ -280,6 +343,61 @@ describe('getBannerAlerts', () => {
     const t = await seedTenant(db.pool);
     await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,'acct_ok','ACTIVE')`, [t.id]);
     expect(await getBannerAlerts(deps, t.id)).toEqual([]);
+  });
+
+  it('connexion ACTIVE : une ancienne alerte stripe_revoked ouverte n’est pas affichée', async () => {
+    const deps = makeDeps(db, NOW);
+    const t = await seedTenant(db.pool);
+    await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,'acct_re','ACTIVE')`, [t.id]);
+    await db.pool.query(`insert into system_alerts (tenant_id, kind, dedupe_key, message) values ($1,'stripe_revoked','old','La connexion Stripe a été révoquée.')`, [t.id]);
+    expect((await getBannerAlerts(deps, t.id)).map((a) => a.kind)).not.toContain('stripe_revoked');
+  });
+
+  it('emails désactivés : bannière warning ; réactivés : plus de bannière', async () => {
+    const deps = makeDeps(db, NOW);
+    const t = await seedTenant(db.pool);
+    await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,'acct_em','ACTIVE')`, [t.id]);
+    await db.pool.query(`update tenants set emails_enabled = false where id = $1`, [t.id]);
+    const off = (await getBannerAlerts(deps, t.id)).find((a) => a.kind === 'emails_disabled');
+    expect(off).toMatchObject({ severity: 'warning', href: '/app/settings' });
+    expect(off!.message).toMatch(/abandonn/);
+    await db.pool.query(`update tenants set emails_enabled = true where id = $1`, [t.id]);
+    expect(await getBannerAlerts(deps, t.id)).toEqual([]);
+  });
+
+  it('customer_email_missing : résolue (et masquée) dès que le client a une adresse email', async () => {
+    const deps = makeDeps(db, NOW);
+    const t = await seedTenant(db.pool);
+    await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,'acct_cm','ACTIVE')`, [t.id]);
+    const cust = await customer(t.id, 'cus_cm', 'Sans Mail', '');
+    const c = await seedCase(db.pool, t.id, { state: 'OPEN', customerId: 'cus_cm' });
+    await db.pool.query(`update recovery_cases set end_customer_id = $2 where id = $1`, [c.id, cust]);
+    await db.pool.query(`insert into system_alerts (tenant_id, kind, dedupe_key, message) values ($1,'customer_email_missing',$2,'Pas d''email')`, [t.id, `customer_email_missing:${t.id}:${c.invoiceId}`]);
+    expect((await getBannerAlerts(deps, t.id)).map((a) => a.kind)).toContain('customer_email_missing');
+    await db.pool.query(`update end_customers set email = 'cm@example.com' where id = $1`, [cust]);
+    expect((await getBannerAlerts(deps, t.id)).map((a) => a.kind)).not.toContain('customer_email_missing');
+    const row = (await db.pool.query(`select resolved_at from system_alerts where tenant_id = $1`, [t.id])).rows[0];
+    expect(row.resolved_at).not.toBeNull();
+  });
+
+  it('email_failed : résolue dès qu’un envoi réussit pour cette étape, conservée sinon', async () => {
+    const deps = makeDeps(db, NOW);
+    const t = await seedTenant(db.pool);
+    await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,'acct_ef','ACTIVE')`, [t.id]);
+    const c = await seedCase(db.pool, t.id, { state: 'RECOVERING' });
+    await db.pool.query(`insert into system_alerts (tenant_id, kind, dedupe_key, message) values ($1,'email_failed',$2,'KO')`, [t.id, `email_failed:${c.id}:1`]);
+    const msg = (step: number, status: string, dryRun: boolean) =>
+      db.pool.query(
+        `insert into email_messages (tenant_id, case_id, step_index, idempotency_key, to_email, subject, status, dry_run) values ($1,$2,$3,$4,'x@example.com','s',$5,$6)`,
+        [t.id, c.id, step, `k:${c.id}:${step}:${status}:${dryRun}`, status, dryRun],
+      );
+    await msg(0, 'SENT', false); // autre étape
+    await msg(1, 'BOUNCED', false); // pas un succès
+    await msg(1, 'SENT', true); // simulation
+    expect((await getBannerAlerts(deps, t.id)).map((a) => a.kind)).toContain('email_failed');
+    await msg(1, 'DELIVERED', false);
+    expect((await getBannerAlerts(deps, t.id)).map((a) => a.kind)).not.toContain('email_failed');
+    expect((await db.pool.query(`select resolved_at from system_alerts where tenant_id = $1`, [t.id])).rows[0].resolved_at).not.toBeNull();
   });
 
   it('une absence de connexion Stripe est signalée', async () => {

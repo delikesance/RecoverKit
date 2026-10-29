@@ -70,6 +70,9 @@ describe('charge : 5 000 étapes échues, 3 workers en parallèle', () => {
     const keys = deps.mailer.sent.map((m) => m.idempotencyKey);
     expect(keys).toHaveLength(TENANTS * PER_TENANT);
     expect(new Set(keys).size).toBe(keys.length); // 0 doublon
+    // le fake dédoublonne : on exige un seul appel à send par clé
+    expect(deps.mailer.calls.size).toBe(TENANTS * PER_TENANT);
+    expect([...deps.mailer.calls.values()].filter((n) => n !== 1)).toEqual([]);
     const status = await db.pool.query(`select status, count(*)::int n from scheduled_steps group by status`);
     expect(Object.fromEntries(status.rows.map((r) => [r.status, r.n]))).toEqual({ SENT: TENANTS * PER_TENANT });
     const emails = await db.pool.query(`select count(*)::int n, count(distinct idempotency_key)::int d from email_messages`);

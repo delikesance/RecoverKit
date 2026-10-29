@@ -82,3 +82,82 @@ test('déconnexion : la session ne donne plus accès', async ({ page, request })
   await expect(page).toHaveURL(/\/login/);
   expect(await lastEmailTo(request, `bye-${n}@example.com`)).toBeTruthy();
 });
+
+test('emails désactivés : l’interface ne dit plus « Relances actives » et prévient que les relances sont abandonnées', async ({ page, request }) => {
+  const n = uid();
+  await login(page, request, `off-${n}@example.com`);
+  await completeOnboarding(page, request, `acct_${n}`);
+
+  await page.goto('/app/settings');
+  await expect(page.locator('.chip', { hasText: 'Relances actives' })).toBeVisible();
+  await page.getByLabel('Envoyer les emails de relance').uncheck();
+  await page.getByRole('button', { name: 'Enregistrer', exact: true }).first().click();
+
+  await page.goto('/app/settings');
+  await expect(page.locator('.chip', { hasText: 'Emails désactivés' })).toBeVisible();
+  await expect(page.locator('.chip', { hasText: 'Relances actives' })).toHaveCount(0);
+  await expect(page.getByText(/abandonnées, pas reportées/).first()).toBeVisible();
+  await page.goto('/app/sequence');
+  await expect(page.locator('.chip', { hasText: 'Emails désactivés' })).toBeVisible();
+  await expect(page.getByText(/12 heures minimum séparent deux emails/)).toBeVisible();
+});
+
+test('filtres des dossiers : virgule décimale acceptée, valeur invalide signalée, état vide exact', async ({ page, request }) => {
+  const n = uid();
+  await login(page, request, `filtre-${n}@example.com`);
+  await completeOnboarding(page, request, `acct_${n}`);
+  await failInvoice(request, `acct_${n}`, { n, email: `c-${n}@example.com`, name: 'Client Filtre', amount: 2900 });
+
+  await page.goto('/app/cases?min=20,5');
+  await expect(page.getByText('Client Filtre')).toBeVisible();
+  await page.goto('/app/cases?min=30,5');
+  await expect(page.getByText('Aucun dossier ne correspond à ces filtres.')).toBeVisible();
+  await page.goto('/app/cases?min=abc');
+  await expect(page.locator('.banner[role="alert"]')).toContainText('Montant minimum invalide');
+  await page.goto('/app/cases?state=lost');
+  await expect(page.getByText('Aucun dossier ne correspond à ces filtres.')).toBeVisible();
+  await expect(page.getByText('Aucun paiement en cours de relance')).toHaveCount(0);
+});
+
+test('modèle d’email invalide : erreur et brouillon via un flash cookie, jamais dans l’URL, lus une seule fois', async ({ page, request }) => {
+  const n = uid();
+  await login(page, request, `tpl-${n}@example.com`);
+  await completeOnboarding(page, request, `acct_${n}`);
+  await page.goto('/app/emails');
+  await page.locator('#subject-0').fill('Mon objet sans lien');
+  await page.locator('#body-0').fill('Texte sans le lien obligatoire');
+  await page.getByRole('button', { name: 'Enregistrer' }).first().click();
+  await expect(page.locator('.banner[role="alert"]')).toBeVisible();
+  await expect(page.locator('#subject-0')).toHaveValue('Mon objet sans lien');
+  await expect(page.locator('#body-0')).toHaveValue('Texte sans le lien obligatoire');
+  expect(page.url()).not.toMatch(/error|draft|Mon\+objet|Mon%20objet/);
+  // Lu une seule fois : au rechargement le brouillon et l'erreur ont disparu.
+  await page.goto('/app/emails');
+  await expect(page.locator('.banner[role="alert"]')).toHaveCount(0);
+  await expect(page.locator('#body-0')).not.toHaveValue('Texte sans le lien obligatoire');
+  // Un texte forgé dans l'URL n'est plus jamais affiché.
+  await page.goto('/app/emails?step=0&error=Votre+compte+est+suspendu&draftSubject=forge&draftBody=forge');
+  await expect(page.locator('.banner[role="alert"]')).toHaveCount(0);
+  await expect(page.getByText('Votre compte est suspendu')).toHaveCount(0);
+  await expect(page.locator('#subject-0')).not.toHaveValue('forge');
+});
+
+test('mobile : la navigation tient sur une ligne défilante et n’occupe pas la moitié de l’écran', async ({ page, request }) => {
+  const n = uid();
+  await page.setViewportSize({ width: 375, height: 800 });
+  await login(page, request, `mob-${n}@example.com`);
+  await completeOnboarding(page, request, `acct_${n}`);
+  await page.goto('/app');
+  const box = await page.getByRole('navigation', { name: 'Principal' }).boundingBox();
+  expect(box!.height).toBeLessThan(80);
+  await expectNoA11yViolations(page);
+});
+
+test('onboarding : l’activation exige un nom d’entreprise autre que « Mon entreprise »', async ({ page, request }) => {
+  const n = uid();
+  await login(page, request, `nom-${n}@example.com`);
+  await page.goto('/app/onboarding');
+  await expect(page.getByLabel('Nom affiché à vos clients')).toHaveValue('');
+  await expect(page.getByText('Il est requis pour activer les relances.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Activer les relances' })).toBeDisabled();
+});

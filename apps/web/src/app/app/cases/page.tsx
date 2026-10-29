@@ -4,6 +4,9 @@ import { loadAppContext } from '@/server/context';
 import { AppShell } from '@/ui/AppShell';
 import { Banners } from '@/ui/Banners';
 import { CasesTable } from '@/ui/CasesTable';
+import { Flash } from '@/ui/Flash';
+import { parseAmountInput } from '@/lib/amount';
+import { caseAttributions } from '@/lib/attribution';
 
 export const metadata: Metadata = { title: 'Échecs en cours' };
 export const dynamic = 'force-dynamic';
@@ -24,16 +27,19 @@ export default async function CasesPage({ searchParams }: { searchParams: Promis
   const stateKey = sp.state && STATE_FILTERS[sp.state] ? sp.state : 'active';
   const sort = SORTS.includes(sp.sort as CaseSort) ? (sp.sort as CaseSort) : 'oldest';
   const page = Math.max(Number(sp.page) || 1, 1);
-  const min = sp.min ? Math.round(Number(sp.min) * 100) : undefined;
-  const max = sp.max ? Math.round(Number(sp.max) * 100) : undefined;
+  const min = parseAmountInput(sp.min);
+  const max = parseAmountInput(sp.max);
+  const amountError = !min.ok ? 'Montant minimum invalide : saisissez un nombre, par exemple 12,50.' : !max.ok ? 'Montant maximum invalide : saisissez un nombre, par exemple 12,50.' : undefined;
   const result = await listCases(ctx.deps, ctx.tenant.id, {
     states: STATE_FILTERS[stateKey],
     sort,
     page,
     pageSize: 25,
-    minAmount: Number.isFinite(min) ? min : undefined,
-    maxAmount: Number.isFinite(max) ? max : undefined,
+    minAmount: min.ok ? min.cents : undefined,
+    maxAmount: max.ok ? max.cents : undefined,
   });
+  const attributions = await caseAttributions(ctx.deps, ctx.tenant.id, result.rows.filter((r) => r.state === 'RECOVERED').map((r) => r.id));
+  const filtered = stateKey !== 'active' || (min.ok && min.cents !== undefined) || (max.ok && max.cents !== undefined);
   const pages = Math.max(Math.ceil(result.total / 25), 1);
   const link = (p: number) => `/app/cases?${new URLSearchParams({ state: stateKey, sort, ...(sp.min ? { min: sp.min } : {}), ...(sp.max ? { max: sp.max } : {}), page: String(p) })}`;
 
@@ -44,6 +50,7 @@ export default async function CasesPage({ searchParams }: { searchParams: Promis
         <p className="page-sub">{result.total} dossier{result.total > 1 ? 's' : ''}</p>
       </div>
       <Banners alerts={ctx.alerts} />
+      <Flash error={amountError} />
       <form method="get" className="panel row wrap" style={{ padding: 20, gap: 16, alignItems: 'flex-end' }} aria-label="Filtres">
         <div><label htmlFor="state" className="label">État</label>
           <select id="state" name="state" className="field" defaultValue={stateKey} style={{ minWidth: 180 }}>
@@ -60,7 +67,7 @@ export default async function CasesPage({ searchParams }: { searchParams: Promis
         <button type="submit" className="btn btn-p">Filtrer</button>
       </form>
       <section className="panel" style={{ padding: '24px 24px 8px' }}>
-        <CasesTable rows={result.rows} now={ctx.now} timeZone={ctx.tenant.timeZone} />
+        <CasesTable rows={result.rows} now={ctx.now} timeZone={ctx.tenant.timeZone} attributions={attributions} filtered={filtered} />
       </section>
       {pages > 1 ? (
         <nav aria-label="Pagination" className="row" style={{ gap: 12, justifyContent: 'center' }}>

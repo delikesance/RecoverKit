@@ -1,9 +1,10 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createTestDb, seedTenant, signStripePayload, stripeEvent, type TestDb } from '@recoverkit/testkit';
 import type { Plan } from '../src/config';
 import { computeTenantMrr, enforceBilling, getBillingStatus, openPortal, receivePlatformWebhook, startCheckout } from '../src/billing/billing';
 import { deleteTenant } from '../src/compliance/delete';
 import { TEST_ENV, makeDeps, type TestDeps } from './helpers';
+import { setupScenario } from './scenario';
 
 let db: TestDb;
 beforeAll(async () => {
@@ -31,8 +32,8 @@ async function founder(name = 'Nimbus Notes') {
   await db.pool.query(`insert into users (tenant_id, email) values ($1, $2)`, [t.id, `f-${t.id.slice(0, 6)}@example.com`]);
   return t;
 }
-function platformEvent(deps: TestDeps, type: string, object: Record<string, unknown>, id?: string, secret = TEST_ENV.STRIPE_PLATFORM_WEBHOOK_SECRET) {
-  const evt = stripeEvent(type, object, { account: null, id, created: deps.clock.now() });
+function platformEvent(deps: TestDeps, type: string, object: Record<string, unknown>, id?: string, secret = TEST_ENV.STRIPE_PLATFORM_WEBHOOK_SECRET, created?: Date) {
+  const evt = stripeEvent(type, object, { account: null, id, created: created ?? deps.clock.now() });
   const raw = JSON.stringify(evt);
   return receivePlatformWebhook(deps, { rawBody: raw, signature: signStripePayload(raw, secret, deps.clock.now()) });
 }
@@ -145,6 +146,56 @@ describe('webhooks de la plateforme', () => {
     expect((await db.pool.query(`select count(*)::int n from system_alerts where tenant_id = $1 and kind = 'billing_past_due' and resolved_at is null`, [t.id])).rows[0].n).toBe(0);
   });
 
+  const at = (sec: number) => new Date(NOW.getTime() + sec * 1000);
+  const subObj = (sub: string, customer: string, status: string) => ({ id: sub, customer, status, items: { data: [{ price: { id: 'price_growth' }, current_period_end: 1795000000 }] } });
+
+  it('un évènement plus ancien arrivé en retard n’écrase pas un évènement plus récent', async () => {
+    const deps = withPlans(makeDeps(db, NOW));
+    const { t, customer, sub } = await subscribed(deps);
+    const secret = TEST_ENV.STRIPE_PLATFORM_WEBHOOK_SECRET;
+    await platformEvent(deps, 'customer.subscription.deleted', subObj(sub, customer, 'canceled'), 'evt_ord_del', secret, at(20));
+    await platformEvent(deps, 'customer.subscription.updated', subObj(sub, customer, 'active'), 'evt_ord_upd', secret, at(10));
+    expect((await billingRow(t.id)).status).toBe('CANCELED');
+  });
+
+  it('un invoice.payment_failed tardif ne remet pas PAST_DUE sur un abonnement redevenu actif', async () => {
+    const deps = withPlans(makeDeps(db, NOW));
+    const { t, customer, sub } = await subscribed(deps);
+    const secret = TEST_ENV.STRIPE_PLATFORM_WEBHOOK_SECRET;
+    await platformEvent(deps, 'customer.subscription.updated', subObj(sub, customer, 'active'), 'evt_ord_a', secret, at(20));
+    await platformEvent(deps, 'invoice.payment_failed', { id: 'in_late', customer, subscription: sub }, 'evt_ord_pf', secret, at(10));
+    const row = await billingRow(t.id);
+    expect(row.status).toBe('ACTIVE');
+    expect(row.past_due_since).toBeNull();
+  });
+
+  it('un évènement d’un autre abonnement que l’abonnement courant est ignoré', async () => {
+    const deps = withPlans(makeDeps(db, NOW));
+    const { t, customer, sub } = await subscribed(deps);
+    deps.billing.addSubscription({ id: sub, customerId: customer, status: 'active', priceId: 'price_growth', currentPeriodEnd: new Date('2026-11-10T00:00:00Z'), cancelAtPeriodEnd: false });
+    await platformEvent(deps, 'checkout.session.completed', { id: 'cs_b', customer, subscription: sub, client_reference_id: t.id });
+    await platformEvent(deps, 'customer.subscription.deleted', { id: 'sub_ancien_A', customer, status: 'canceled', items: { data: [] } });
+    expect(await billingRow(t.id)).toMatchObject({ status: 'ACTIVE', stripe_subscription_id: sub });
+  });
+
+  it('startCheckout redirige vers le portail si un abonnement actif ou en essai existe', async () => {
+    const deps = withPlans(makeDeps(db, NOW));
+    const t = await founder();
+    await db.pool.query(`insert into billing_subscriptions (tenant_id, stripe_customer_id, stripe_subscription_id, status, plan) values ($1,'cus_dup','sub_dup','ACTIVE','start')`, [t.id]);
+    const r = await startCheckout(deps, t.id, 'growth');
+    expect(r).toMatchObject({ status: 'ok' });
+    if (r.status === 'ok') expect(r.url).toContain('fake-portal');
+  });
+
+  it('startCheckout redirige aussi vers le portail si l\'abonnement est PAST_DUE (pas de second abonnement)', async () => {
+    const deps = withPlans(makeDeps(db, NOW));
+    const t = await founder();
+    await db.pool.query(`insert into billing_subscriptions (tenant_id, stripe_customer_id, stripe_subscription_id, status, plan, past_due_since) values ($1,'cus_pd','sub_pd','PAST_DUE','start',$2)`, [t.id, NOW]);
+    const r = await startCheckout(deps, t.id, 'growth');
+    expect(r).toMatchObject({ status: 'ok' });
+    if (r.status === 'ok') expect(r.url).toContain('fake-portal');
+  });
+
   it('client Stripe inconnu : ignoré sans erreur', async () => {
     const deps = withPlans(makeDeps(db, NOW));
     expect((await platformEvent(deps, 'invoice.paid', { customer: 'cus_inconnu' })).httpStatus).toBe(200);
@@ -184,6 +235,68 @@ describe('revenu mensuel et paliers', () => {
     deps.stripe.addSubscription(account, { id: `sub_${t.id.slice(0, 6)}_0`, customerId: 'cus', status: 'active', planName: null, amount: 100_000, currency: 'EUR', interval: 'month' });
     await computeTenantMrr(deps, t.id);
     expect((await db.pool.query(`select count(*)::int n from system_alerts where tenant_id = $1 and kind = 'plan_exceeded' and resolved_at is null`, [t.id])).rows[0].n).toBe(0);
+  });
+
+  it('compare les devises en valeur majeure (KWD à 3 décimales vs EUR) et les paliers dans leur devise', async () => {
+    const deps = withPlans(makeDeps(db, NOW));
+    const t = await founder();
+    const account = `acct_${t.id.slice(0, 8)}`;
+    await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,$2,'ACTIVE')`, [t.id, account]);
+    // 100 000 unités KWD = 100 KWD (~300 EUR) ; 50 000 centimes EUR = 500 EUR : l'EUR domine
+    deps.stripe.addSubscription(account, { id: 'sub_k1', customerId: 'c', status: 'active', planName: null, amount: 100_000, currency: 'KWD', interval: 'month' });
+    deps.stripe.addSubscription(account, { id: 'sub_e1', customerId: 'c', status: 'active', planName: null, amount: 50_000, currency: 'EUR', interval: 'month' });
+    const r = await computeTenantMrr(deps, t.id);
+    expect(r).toMatchObject({ status: 'ok', mrr: 50_000, currency: 'EUR', suggestedPlan: 'start', exceeded: false });
+  });
+
+  it('un MRR dans une devise autre que celle des paliers ne déclenche pas de dépassement', async () => {
+    const deps = withPlans(makeDeps(db, NOW));
+    const t = await founder();
+    const account = `acct_${t.id.slice(0, 8)}`;
+    await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,$2,'ACTIVE')`, [t.id, account]);
+    await db.pool.query(`insert into billing_subscriptions (tenant_id, plan, status) values ($1,'start','ACTIVE')`, [t.id]);
+    // 900 000 JPY (0 décimale) = 900 000 en unités mineures brutes > maxMrr 500 000, mais ce ne sont pas des euros
+    deps.stripe.addSubscription(account, { id: 'sub_j1', customerId: 'c', status: 'active', planName: null, amount: 900_000, currency: 'JPY', interval: 'month' });
+    const r = await computeTenantMrr(deps, t.id);
+    expect(r).toMatchObject({ status: 'ok', mrr: 0, currency: 'EUR', exceeded: false, suggestedPlan: 'start', ignoredCurrencies: ['JPY'], byCurrency: { JPY: 900_000 } });
+    expect(await billingRow(t.id)).toMatchObject({ mrr_amount: 0, mrr_currency: 'EUR' });
+  });
+
+  it('les paliers peuvent être dans une autre devise (champ currency) : le MRR de cette devise compte', async () => {
+    const usdPlans: Plan[] = PLANS.map((p) => ({ ...p, currency: 'USD' }));
+    const deps = withPlans(makeDeps(db, NOW), usdPlans);
+    const t = await founder();
+    const account = `acct_${t.id.slice(0, 8)}`;
+    await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,$2,'ACTIVE')`, [t.id, account]);
+    await db.pool.query(`insert into billing_subscriptions (tenant_id, plan, status) values ($1,'start','ACTIVE')`, [t.id]);
+    deps.stripe.addSubscription(account, { id: 'sub_u1', customerId: 'c', status: 'active', planName: null, amount: 600_000, currency: 'USD', interval: 'month' });
+    deps.stripe.addSubscription(account, { id: 'sub_e9', customerId: 'c', status: 'active', planName: null, amount: 100, currency: 'EUR', interval: 'month' });
+    const r = await computeTenantMrr(deps, t.id);
+    expect(r).toMatchObject({ status: 'ok', mrr: 600_000, currency: 'USD', exceeded: true, suggestedPlan: 'growth', ignoredCurrencies: ['EUR'] });
+  });
+
+  it('multi-devises : MRR stocké et renvoyé dans la devise des paliers (100 EUR + 150 USD)', async () => {
+    const deps = withPlans(makeDeps(db, NOW));
+    const t = await founder();
+    const account = `acct_${t.id.slice(0, 8)}`;
+    await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,$2,'ACTIVE')`, [t.id, account]);
+    deps.stripe.addSubscription(account, { id: 'sub_m1', customerId: 'c', status: 'active', planName: null, amount: 10_000, currency: 'EUR', interval: 'month' });
+    deps.stripe.addSubscription(account, { id: 'sub_m2', customerId: 'c', status: 'active', planName: null, amount: 15_000, currency: 'USD', interval: 'month' });
+    const r = await computeTenantMrr(deps, t.id);
+    expect(r).toMatchObject({ status: 'ok', mrr: 10_000, currency: 'EUR', ignoredCurrencies: ['USD'], byCurrency: { EUR: 10_000, USD: 15_000 } });
+    expect(await billingRow(t.id)).toMatchObject({ mrr_amount: 10_000, mrr_currency: 'EUR' });
+    expect((await getBillingStatus(deps, t.id)).mrr).toEqual({ amount: 10_000, currency: 'EUR' });
+  });
+
+  it('devise principale : ISK/UGX sont comptées en centièmes par Stripe (currencyDigits de core)', async () => {
+    const deps = withPlans(makeDeps(db, NOW));
+    const t = await founder();
+    const account = `acct_${t.id.slice(0, 8)}`;
+    await db.pool.query(`insert into stripe_connections (tenant_id, stripe_account_id, status) values ($1,$2,'ACTIVE')`, [t.id, account]);
+    // 10 000 unités ISK = 100 ISK (~1 EUR) ; 50 000 centimes EUR = 500 EUR : l'EUR domine
+    deps.stripe.addSubscription(account, { id: 'sub_i1', customerId: 'c', status: 'active', planName: null, amount: 10_000, currency: 'ISK', interval: 'month' });
+    deps.stripe.addSubscription(account, { id: 'sub_e2', customerId: 'c', status: 'active', planName: null, amount: 50_000, currency: 'EUR', interval: 'month' });
+    expect(await computeTenantMrr(deps, t.id)).toMatchObject({ status: 'ok', mrr: 50_000, currency: 'EUR' });
   });
 
   it('sans connexion Stripe : rien à calculer', async () => {
@@ -230,6 +343,34 @@ describe('application de la facturation', () => {
     await db.pool.query(`insert into billing_subscriptions (tenant_id, status, plan) values ($1,'ACTIVE','start')`, [t.id]);
     expect(await enforceBilling(deps)).toMatchObject({ reactivated: 1 });
     expect((await tenantRow(t.id)).status).toBe('ACTIVE');
+  });
+
+  it('la réactivation lance une réconciliation Stripe sans bloquer ni échouer, même si Stripe est en panne', async () => {
+    const deps = withPlans(makeDeps(db, NOW));
+    const s = await setupScenario(db, deps);
+    await db.pool.query(`update tenants set status = 'SUSPENDED', created_at = $2 where id = $1`, [s.tenantId, new Date(NOW.getTime() - 40 * 86400_000)]);
+    await db.pool.query(`insert into billing_subscriptions (tenant_id, status, plan) values ($1,'ACTIVE','start')`, [s.tenantId]);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const original = deps.stripe.listOpenInvoices.bind(deps.stripe);
+    deps.stripe.listOpenInvoices = async (account: string) => {
+      await gate; // Stripe lent : enforceBilling ne doit pas l'attendre
+      return original(account);
+    };
+    expect(await enforceBilling(deps)).toMatchObject({ reactivated: 1 });
+    release();
+    await vi.waitFor(async () => {
+      expect((await db.pool.query(`select count(*)::int n from inbox_events where tenant_id = $1`, [s.tenantId])).rows[0].n).toBe(1);
+    });
+
+    const s2 = await setupScenario(db, deps);
+    await db.pool.query(`update tenants set status = 'SUSPENDED', created_at = $2 where id = $1`, [s2.tenantId, new Date(NOW.getTime() - 40 * 86400_000)]);
+    await db.pool.query(`insert into billing_subscriptions (tenant_id, status, plan) values ($1,'ACTIVE','start')`, [s2.tenantId]);
+    deps.stripe.listOpenInvoices = async () => {
+      throw new Error('Stripe indisponible');
+    };
+    await expect(enforceBilling(deps)).resolves.toMatchObject({ reactivated: expect.any(Number) });
+    expect((await tenantRow(s2.tenantId)).status).toBe('ACTIVE');
   });
 
   it('impayé : délai de grâce de 7 jours, puis suspension douce', async () => {

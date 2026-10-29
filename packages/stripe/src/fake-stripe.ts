@@ -8,7 +8,7 @@ import {
   type SubscriptionData,
 } from './gateway';
 
-type CardBehavior = { kind: 'succeed' } | { kind: 'decline'; code: string } | { kind: '3ds' };
+type CardBehavior = { kind: 'succeed' } | { kind: 'decline'; code: string } | { kind: '3ds' } | { kind: 'processing' };
 
 /** Stripe en mémoire pour les tests : comptes, factures, cartes programmables. */
 export class FakeStripe implements StripeGateway {
@@ -24,6 +24,8 @@ export class FakeStripe implements StripeGateway {
   private failures: Error[] = [];
   private seq = 0;
   readonly deauthorized: string[] = [];
+  /** Clés d'idempotence reçues par payInvoice, dans l'ordre (rejeux inclus). */
+  readonly idempotencyKeys: string[] = [];
 
   private key(account: string, id: string): string {
     return `${account}/${id}`;
@@ -38,7 +40,7 @@ export class FakeStripe implements StripeGateway {
   addSubscription(account: string, s: SubscriptionData): void {
     this.subscriptions.set(this.key(account, s.id), { ...s });
   }
-  setCardBehavior(paymentMethodId: string, kind: 'succeed' | 'decline' | '3ds', code = 'card_declined'): void {
+  setCardBehavior(paymentMethodId: string, kind: 'succeed' | 'decline' | '3ds' | 'processing', code = 'card_declined'): void {
     this.cards.set(paymentMethodId, kind === 'decline' ? { kind, code } : { kind });
   }
   setOAuthCode(code: string, v: { stripeUserId: string; livemode: boolean }): void {
@@ -113,6 +115,7 @@ export class FakeStripe implements StripeGateway {
     o: { paymentMethodId: string; idempotencyKey: string },
   ): Promise<PayResult> {
     this.maybeFail();
+    this.idempotencyKeys.push(o.idempotencyKey);
     const idem = `${account}/${o.idempotencyKey}`;
     const cached = this.idempotent.get(idem);
     if (cached) return cached;
@@ -120,7 +123,8 @@ export class FakeStripe implements StripeGateway {
     const inv = this.must(this.invoices, account, invoiceId);
     let result: PayResult;
     if (inv.status === 'paid') {
-      result = { status: 'paid' };
+      // Stripe répond 400 sur une facture déjà payée
+      throw new GatewayError(`La facture ${invoiceId} est déjà payée`, { kind: 'invalid_request', retryable: false });
     } else {
       const behavior = this.cards.get(o.paymentMethodId) ?? { kind: 'succeed' as const };
       if (behavior.kind === 'succeed') {
@@ -131,6 +135,8 @@ export class FakeStripe implements StripeGateway {
         result = { status: 'paid' };
       } else if (behavior.kind === 'decline') {
         result = { status: 'failed', errorCode: behavior.code };
+      } else if (behavior.kind === 'processing') {
+        result = { status: 'processing' };
       } else {
         result = { status: 'requires_action' };
       }
