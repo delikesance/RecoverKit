@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
-import { FakeDomainProvider, ResendDomainProvider, MailerError } from '../src';
+import { ResendDomainProvider, MailerError } from '../src';
 
 let server: Server | undefined;
 afterEach(() => new Promise<void>((r) => (server ? server.close(() => r()) : r())));
@@ -65,31 +65,59 @@ describe('ResendDomainProvider', () => {
     expect(seen[0]).toMatchObject({ method: 'DELETE', url: '/domains/dom_1' });
   });
 
-  it('erreur 4xx permanente, 5xx temporaire', async () => {
-    const a = await start(() => ({ status: 403, json: { message: 'domain already registered' } }));
-    const e1 = await new ResendDomainProvider({ apiKey: 'k', baseUrl: a.baseUrl }).createDomain('x.example').catch((e) => e);
-    expect(e1).toBeInstanceOf(MailerError);
-    expect(e1.permanent).toBe(true);
-    await new Promise<void>((r) => server!.close(() => r()));
-    server = undefined;
-    const b = await start(() => ({ status: 503, json: {} }));
-    const e2 = await new ResendDomainProvider({ apiKey: 'k', baseUrl: b.baseUrl }).getDomain('d').catch((e) => e);
-    expect(e2.permanent).toBe(false);
+  it('seuls 400/422 sont permanents ; 401/403/409/429/5xx se corrigent et se rejouent', async () => {
+    for (const [status, permanent] of [[400, true], [422, true], [401, false], [403, false], [404, false], [409, false], [429, false], [500, false], [503, false]] as const) {
+      const { baseUrl } = await start(() => ({ status, json: { message: 'x' } }));
+      const err = await new ResendDomainProvider({ apiKey: 'k', baseUrl }).createDomain('x.example').catch((e) => e);
+      expect(err).toBeInstanceOf(MailerError);
+      expect(err.permanent, `statut ${status}`).toBe(permanent);
+      await new Promise<void>((r) => server!.close(() => r()));
+      server = undefined;
+    }
   });
-});
 
-describe('FakeDomainProvider', () => {
-  it('crée, vérifie et supprime', async () => {
-    const f = new FakeDomainProvider();
-    const d = await f.createDomain('nimbusnotes.example');
-    expect(d.status).toBe('pending');
-    expect(d.records.length).toBeGreaterThan(0);
-    await f.verifyDomain(d.id);
-    expect((await f.getDomain(d.id)).status).toBe('pending');
-    f.markVerified(d.id);
-    expect((await f.getDomain(d.id)).status).toBe('verified');
-    await f.deleteDomain(d.id);
-    expect(f.deleted).toContain(d.id);
-    await expect(f.getDomain(d.id)).rejects.toThrow(/introuvable/);
+  it('un fournisseur qui ne répond pas : délai dépassé, erreur temporaire', async () => {
+    server = createServer(() => {
+      /* ne répond jamais */
+    });
+    await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r));
+    const port = (server.address() as { port: number }).port;
+    const err = await new ResendDomainProvider({ apiKey: 'k', baseUrl: `http://127.0.0.1:${port}`, timeoutMs: 200 }).getDomain('d').catch((e) => e);
+    expect(err).toBeInstanceOf(MailerError);
+    expect(err.permanent).toBe(false);
+    server.closeAllConnections();
+  });
+
+  async function rawServer(status: number, text: string) {
+    const seen: { method?: string; url?: string }[] = [];
+    server = createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        seen.push({ method: req.method, url: req.url });
+        res.writeHead(status, text ? { 'content-type': 'application/json' } : {});
+        res.end(text);
+      });
+    });
+    await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r));
+    return { baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`, seen };
+  }
+
+  it('corps non JSON sur une réponse 200 : MailerError temporaire, pas de SyntaxError brute', async () => {
+    const { baseUrl } = await rawServer(200, '<html>bad gateway</html>');
+    const err = await new ResendDomainProvider({ apiKey: 'k', baseUrl }).getDomain('d').catch((e) => e);
+    expect(err).toBeInstanceOf(MailerError);
+    expect(err.permanent).toBe(false);
+  });
+
+  it('verifyDomain et deleteDomain acceptent un 204 sans corps ou un corps non JSON', async () => {
+    for (const [status, text] of [[204, ''], [200, 'ok']] as const) {
+      const { baseUrl, seen } = await rawServer(status, text);
+      const p = new ResendDomainProvider({ apiKey: 'k', baseUrl });
+      await expect(p.verifyDomain('dom_1')).resolves.toBeUndefined();
+      await expect(p.deleteDomain('dom_1')).resolves.toBeUndefined();
+      expect(seen.map((s) => s.method)).toEqual(['POST', 'DELETE']);
+      await new Promise<void>((r) => server!.close(() => r()));
+      server = undefined;
+    }
   });
 });

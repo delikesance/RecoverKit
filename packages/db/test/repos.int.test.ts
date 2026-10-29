@@ -169,6 +169,125 @@ describe('scheduled_steps : réservation', () => {
     expect(bySmall).toBe(5); // tout le petit tenant passe, malgré ses échéances plus tardives
   });
 
+  it('ne réserve qu’une étape par dossier, la plus petite, et aucune tant qu’une est en cours d’envoi', async () => {
+    const t = await seedTenant(db.pool);
+    const c = await seedCase(db.pool, t.id);
+    for (let i = 0; i < 4; i++) await seedStep(db.pool, c.id, t.id, { stepIndex: i, dueAt: new Date(due.getTime() + i * 1000) });
+    const first = await reserveDueSteps(db.pool, now, 50, { tenantId: t.id });
+    expect(first.map((s) => s.stepIndex)).toEqual([0]);
+    expect(await reserveDueSteps(db.pool, now, 50, { tenantId: t.id })).toEqual([]); // step 0 en SENDING
+    await db.pool.query(`update scheduled_steps set status = 'SENT' where id = $1`, [first[0]!.id]);
+    expect((await reserveDueSteps(db.pool, now, 50, { tenantId: t.id })).map((s) => s.stepIndex)).toEqual([1]);
+  });
+
+  it('deux réservations concurrentes ne prennent jamais deux étapes du même dossier', async () => {
+    const t = await seedTenant(db.pool);
+    const c = await seedCase(db.pool, t.id);
+    for (let i = 0; i < 4; i++) await seedStep(db.pool, c.id, t.id, { stepIndex: i, dueAt: due });
+    const batches = await Promise.all([1, 2, 3, 4].map(() => reserveDueSteps(db.pool, now, 50, { tenantId: t.id })));
+    expect(batches.flat()).toHaveLength(1);
+  });
+
+  it('course déterministe : une ligne verrouillée par une autre transaction est sautée sans attendre', async () => {
+    const t = await seedTenant(db.pool);
+    for (let i = 0; i < 30; i++) {
+      const c = await seedCase(db.pool, t.id);
+      await seedStep(db.pool, c.id, t.id, { dueAt: new Date(due.getTime() + i * 1000) });
+    }
+    const holder = await db.pool.connect();
+    try {
+      await holder.query('begin');
+      // le « worker A » a verrouillé les 5 premières lignes (les premières que B voudrait prendre)
+      const locked = await holder.query(
+        `select id from scheduled_steps where tenant_id = $1 and status = 'SCHEDULED' order by due_at, id limit 5 for update`,
+        [t.id],
+      );
+      const lockedIds = new Set(locked.rows.map((r) => r.id as string));
+      expect(lockedIds.size).toBe(5);
+
+      // sans SKIP LOCKED, B resterait bloqué tant que A garde ses verrous
+      const timeout = new Promise<'bloqué'>((resolve) => setTimeout(() => resolve('bloqué'), 5000));
+      const b = await Promise.race([reserveDueSteps(db.pool, now, 10, { tenantId: t.id }), timeout]);
+      expect(b, 'la réservation attend un verrou au lieu de le sauter').not.toBe('bloqué');
+      const got = b as Awaited<ReturnType<typeof reserveDueSteps>>;
+      expect(got).toHaveLength(10);
+      expect(got.some((s) => lockedIds.has(s.id))).toBe(false);
+
+      // A annule : ses lignes redeviennent réservables, une seule fois chacune
+      await holder.query('rollback');
+      const rest = await reserveDueSteps(db.pool, now, 100, { tenantId: t.id });
+      const all = [...got, ...rest].map((s) => s.id);
+      expect(new Set(all).size).toBe(30);
+      expect(rest.filter((s) => lockedIds.has(s.id))).toHaveLength(5);
+    } finally {
+      await holder.query('rollback').catch(() => undefined);
+      holder.release();
+    }
+  });
+
+  it('course déterministe : une ligne passée à SENT par une transaction concurrente validée n’est jamais réservée', async () => {
+    const t = await seedTenant(db.pool);
+    const ids: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const c = await seedCase(db.pool, t.id);
+      ids.push((await seedStep(db.pool, c.id, t.id, { dueAt: due })).id);
+    }
+    const holder = await db.pool.connect();
+    try {
+      await holder.query('begin');
+      await holder.query(`update scheduled_steps set status = 'SENT' where id = any($1)`, [ids.slice(0, 4)]);
+      const reservation = reserveDueSteps(db.pool, now, 10, { tenantId: t.id });
+      await holder.query('commit');
+      const got = await reservation;
+      expect(got.map((s) => s.id).filter((id) => ids.slice(0, 4).includes(id))).toEqual([]);
+      expect(got).toHaveLength(6);
+    } finally {
+      await holder.query('rollback').catch(() => undefined);
+      holder.release();
+    }
+  });
+
+  it('à grande échelle : 8 workers concurrents, 300 dossiers x 4 étapes, jamais deux étapes du même dossier ni deux fois la même', async () => {
+    const tenants = await Promise.all([1, 2, 3].map(() => seedTenant(db.pool)));
+    const cases = 300;
+    const caseIds: string[] = [];
+    for (let i = 0; i < cases; i++) {
+      const t = tenants[i % tenants.length]!;
+      caseIds.push((await seedCase(db.pool, t.id)).id);
+    }
+    await db.pool.query(
+      `insert into scheduled_steps (case_id, tenant_id, step_index, due_at)
+       select c.id, c.tenant_id, g, $2::timestamptz from recovery_cases c, generate_series(0, 3) g where c.id = any($1)`,
+      [caseIds, due],
+    );
+    const seen = new Set<string>();
+    for (let round = 0; round < 4; round++) {
+      const batches = await Promise.all(Array.from({ length: 8 }, () => reserveDueSteps(db.pool, now, 60)));
+      const flat = batches.flat().filter((s) => caseIds.includes(s.caseId));
+      const caseSet = new Set(flat.map((s) => s.caseId));
+      expect(caseSet.size, `deux étapes du même dossier réservées dans le tour ${round}`).toBe(flat.length);
+      for (const s of flat) {
+        expect(seen.has(s.id), `étape ${s.id} réservée deux fois`).toBe(false);
+        expect(s.stepIndex).toBe(round); // toujours la plus petite étape restante
+        seen.add(s.id);
+      }
+      // des workers concurrents peuvent se partager un tour sur plusieurs appels : on vide le tour
+      let rest = await reserveDueSteps(db.pool, now, 1000);
+      while (rest.length > 0) {
+        for (const s of rest.filter((x) => caseIds.includes(x.caseId))) {
+          expect(seen.has(s.id)).toBe(false);
+          expect(s.stepIndex).toBe(round);
+          seen.add(s.id);
+        }
+        rest = await reserveDueSteps(db.pool, now, 1000);
+      }
+      await db.pool.query(`update scheduled_steps set status = 'SENT' where case_id = any($1) and status = 'SENDING'`, [caseIds]);
+    }
+    expect(seen.size).toBe(cases * 4);
+    const attempts = await db.pool.query(`select max(attempts)::int m from scheduled_steps where case_id = any($1)`, [caseIds]);
+    expect(attempts.rows[0].m).toBe(1);
+  }, 60000);
+
   it('récupère les réservations bloquées depuis plus de 10 minutes', async () => {
     const t = await seedTenant(db.pool);
     const c1 = await seedCase(db.pool, t.id);
@@ -181,6 +300,22 @@ describe('scheduled_steps : réservation', () => {
     const byId = Object.fromEntries(statuses.rows.map((r) => [r.id, r.status]));
     expect(byId[stale.id]).toBe('SCHEDULED');
     expect(byId[fresh.id]).toBe('SENDING');
+  });
+
+  it('avec un plafond de tentatives : l’étape qui l’a atteint passe FAILED(send_failed) au lieu d’être rejouée', async () => {
+    const t = await seedTenant(db.pool);
+    const c1 = await seedCase(db.pool, t.id);
+    const c2 = await seedCase(db.pool, t.id);
+    const capped = await seedStep(db.pool, c1.id, t.id, { status: 'SENDING', reservedAt: new Date('2026-10-02T11:40:00Z') });
+    const below = await seedStep(db.pool, c2.id, t.id, { status: 'SENDING', reservedAt: new Date('2026-10-02T11:40:00Z') });
+    await db.pool.query(`update scheduled_steps set attempts = 3 where id = $1`, [capped.id]);
+    await db.pool.query(`update scheduled_steps set attempts = 2 where id = $1`, [below.id]);
+    const recovered = await recoverStaleReservations(db.pool, now, 10 * 60_000, 3);
+    const byId = Object.fromEntries(recovered.map((r) => [r.id, r.status]));
+    expect(byId[capped.id]).toBe('FAILED');
+    expect(byId[below.id]).toBe('SCHEDULED');
+    const row = await db.pool.query(`select skip_reason, reserved_at from scheduled_steps where id = $1`, [capped.id]);
+    expect(row.rows[0]).toMatchObject({ skip_reason: 'send_failed', reserved_at: null });
   });
 });
 

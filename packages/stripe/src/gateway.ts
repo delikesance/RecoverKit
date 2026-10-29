@@ -23,7 +23,12 @@ export interface InvoiceData {
   currency: string;
   attemptCount: number;
   planName?: string | null;
+  /** Motif du dernier refus de paiement (decline_code ?? code), lu sur le PaymentIntent de la facture. */
   lastErrorCode?: string | null;
+  /** Moyen de paiement du dernier échec. */
+  failedPaymentMethodId?: string | null;
+  /** Date du dernier échec de paiement, si Stripe la fournit. */
+  failedAt?: Date | null;
   paidAt?: Date | null;
   /** Page Stripe de la facture : sert de repli pour l'authentification 3D Secure. */
   hostedInvoiceUrl?: string | null;
@@ -47,6 +52,8 @@ export interface SubscriptionData {
   currency: string;
   interval: 'day' | 'week' | 'month' | 'year';
   intervalCount?: number;
+  /** Items sans montant unitaire (paliers, mesuré) : non comptés dans `amount`. */
+  unpricedItems?: number;
 }
 
 export interface SetupIntentData {
@@ -59,6 +66,8 @@ export interface SetupIntentData {
 
 export type PayResult =
   | { status: 'paid' }
+  /** Paiement asynchrone (ex. SEPA) en cours : la facture reste ouverte, invoice.paid ou invoice.payment_failed conclura. */
+  | { status: 'processing' }
   | { status: 'failed'; errorCode: string }
   | { status: 'requires_action' };
 

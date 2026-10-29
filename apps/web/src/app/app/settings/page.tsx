@@ -1,10 +1,13 @@
 import type { Metadata } from 'next';
 import { checkSenderDomain, getOnboardingStatus } from '@recoverkit/services';
 import { loadAppContext } from '@/server/context';
+import { readFlash } from '@/server/flash';
 import { AppShell } from '@/ui/AppShell';
 import { Banners } from '@/ui/Banners';
 import { Chip } from '@/ui/Chip';
 import { Flash } from '@/ui/Flash';
+import { FlashClear } from '@/ui/FlashClear';
+import { sendMode } from '@/lib/format';
 import {
   checkSenderAction,
   configureSenderAction,
@@ -20,27 +23,30 @@ export const dynamic = 'force-dynamic';
 
 const ZONES = ['Europe/Paris', 'Europe/Brussels', 'Europe/Zurich', 'Europe/London', 'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'America/Montreal', 'Asia/Tokyo', 'Australia/Sydney', 'UTC'];
 
-export default async function SettingsPage({ searchParams }: { searchParams: Promise<{ notice?: string; error?: string }> }) {
+export default async function SettingsPage({ searchParams }: { searchParams: Promise<{ notice?: string }> }) {
   const sp = await searchParams;
+  const flash = await readFlash('/app/settings');
   const ctx = await loadAppContext();
   const t = ctx.tenant;
   const sender = await checkSenderDomain(ctx.deps, t.id).catch(() => ({ status: 'none' as const }));
   const onboarding = await getOnboardingStatus(ctx.deps, t.id);
+  const mode = sendMode(t);
   const zones = ZONES.includes(t.timeZone) ? ZONES : [t.timeZone, ...ZONES];
 
   return (
     <AppShell tenantName={t.name} active="settings" activeCases={ctx.activeCases} stripe={ctx.stripe} userEmail={ctx.session.email}>
       <div><h1 className="page-title">Réglages</h1><p className="page-sub">Votre entreprise, vos envois et vos données.</p></div>
       <Banners alerts={ctx.alerts} />
-      <Flash notice={sp.notice} error={sp.error} />
+      <Flash notice={sp.notice} error={flash?.error} />
+      {flash ? <FlashClear /> : null}
 
       <section className="panel" style={{ padding: 24 }} aria-labelledby="h-mode">
         <div className="row wrap" style={{ justifyContent: 'space-between', gap: 16 }}>
           <div>
             <h2 id="h-mode" className="section-title">Envois aux clients</h2>
-            <p className="muted" style={{ marginTop: 4, maxWidth: '44em' }}>{t.dryRun ? 'Mode test : RecoverKit enregistre ce qui serait envoyé, sans écrire à vos clients ni retenter de paiement.' : 'Relances actives : vos clients reçoivent les emails et les paiements sont retentés.'}</p>
+            <p className="muted" style={{ marginTop: 4, maxWidth: '44em' }}>{mode.text}</p>
           </div>
-          <Chip tone={t.dryRun ? 'warning' : 'success'}>{t.dryRun ? 'Mode test' : 'Relances actives'}</Chip>
+          <Chip tone={mode.tone}>{mode.label}</Chip>
         </div>
         <form action={setDryRunAction} className="row wrap" style={{ marginTop: 16, gap: 12 }}>
           <input type="hidden" name="mode" value={t.dryRun ? 'live' : 'test'} />
@@ -66,7 +72,8 @@ export default async function SettingsPage({ searchParams }: { searchParams: Pro
           <div style={{ flex: '1 1 130px' }}><label htmlFor="sendStartHour" className="label">Envoi dès (heure)</label><input id="sendStartHour" name="sendStartHour" type="number" min={0} max={23} className="field" defaultValue={t.sendStartHour} /></div>
           <div style={{ flex: '1 1 130px' }}><label htmlFor="sendEndHour" className="label">Jusqu’à (heure)</label><input id="sendEndHour" name="sendEndHour" type="number" min={1} max={24} className="field" defaultValue={t.sendEndHour} /></div>
         </div>
-        <label className="row" style={{ gap: 10, fontWeight: 500, minHeight: 44 }}><input type="checkbox" name="emailsEnabled" defaultChecked={t.emailsEnabled} style={{ width: 20, height: 20 }} /> Envoyer les emails de relance (décochez pour tout suspendre)</label>
+        <label className="row" style={{ gap: 10, fontWeight: 500, minHeight: 44 }}><input type="checkbox" name="emailsEnabled" defaultChecked={t.emailsEnabled} style={{ width: 20, height: 20 }} aria-describedby="emails-hint" /> Envoyer les emails de relance</label>
+        <p id="emails-hint" className="hint" style={{ marginTop: -8 }}>Si vous désactivez les emails, les relances dues pendant ce temps sont abandonnées, pas reportées.</p>
         <label className="row" style={{ gap: 10, fontWeight: 500, minHeight: 44 }}><input type="checkbox" name="digestEnabled" defaultChecked={t.digestEnabled} style={{ width: 20, height: 20 }} /> Recevoir le récapitulatif du lundi par email</label>
         <div><button type="submit" className="btn btn-p">Enregistrer</button></div>
       </form>

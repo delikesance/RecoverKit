@@ -1,8 +1,10 @@
 import { randomBytes } from 'node:crypto';
-import { hashToken } from '@recoverkit/core';
+import { hashToken, MIN_GAP_MS, nextWindowInstant } from '@recoverkit/core';
 import { logAction, withTransaction, type Queryable } from '@recoverkit/db';
 import type { Deps } from '../deps';
 import type { SessionIdentity } from '../auth/auth';
+import { loadTenant, lockTenant } from '../recovery/ops';
+import { reconcileTenant } from '../ops/reconcile';
 
 const STATE_TTL_MS = 10 * 60_000;
 
@@ -84,7 +86,7 @@ export async function handleOAuthCallback(
     return { status: 'exchange_failed' };
   }
 
-  return withTransaction(deps.pool, async (tx) => {
+  const result = await withTransaction(deps.pool, async (tx) => {
     const taken = await tx.query(
       `select tenant_id from stripe_connections where stripe_account_id = $1 and tenant_id <> $2`,
       [account.stripeUserId, session.tenantId],
@@ -106,8 +108,62 @@ export async function handleOAuthCallback(
       action: 'stripe.connected',
       details: { accountId: account.stripeUserId, livemode: account.livemode },
     });
+    await resolveRevokedAlert(tx, session.tenantId, now);
+    await rescheduleRevokedSteps(deps, tx, session.tenantId);
     return { status: 'connected', accountId: account.stripeUserId } as const;
   });
+  if (result.status === 'connected') void reconcileInBackground(deps, session.tenantId);
+  return result;
+}
+
+/**
+ * Rattrape ce qui s'est passé pendant l'interruption (reconnexion OAuth, réactivation du tenant) : réconciliation
+ * du tenant lancée sans bloquer l'appelant ; ne rejette jamais (une erreur est seulement journalisée).
+ */
+export async function reconcileInBackground(deps: Deps, tenantId: string): Promise<void> {
+  try {
+    await reconcileTenant(deps, tenantId);
+  } catch (e) {
+    deps.log.warn({ tenantId, err: (e as Error).message }, 'réconciliation après reconnexion/réactivation impossible');
+  }
+}
+
+async function resolveRevokedAlert(tx: Queryable, tenantId: string, now: Date): Promise<void> {
+  await tx.query(`update system_alerts set resolved_at = $2 where dedupe_key = $1 and resolved_at is null`, [`stripe_revoked:${tenantId}`, now]);
+}
+
+/** Reconnexion : les étapes annulées par la révocation redeviennent planifiables (dans la fenêtre d'envoi, avec l'écart minimal). */
+async function rescheduleRevokedSteps(deps: Deps, tx: Queryable, tenantId: string): Promise<void> {
+  await lockTenant(tx, tenantId);
+  const tenant = await loadTenant(tx, tenantId);
+  if (!tenant) return;
+  const window = { startHour: tenant.sendStartHour, endHour: tenant.sendEndHour, timeZone: tenant.timeZone };
+  const now = deps.clock.now();
+  const steps = await tx.query(
+    `select s.id, s.case_id, s.due_at from scheduled_steps s join recovery_cases c on c.id = s.case_id
+      where s.tenant_id = $1 and s.status = 'CANCELED' and s.skip_reason = 'stripe_revoked' and c.state in ('RECOVERING','PAUSED')
+      order by s.case_id, s.step_index`,
+    [tenantId],
+  );
+  let currentCase: string | null = null;
+  let previous: number | null = null;
+  const perCase = new Map<string, number>();
+  for (const st of steps.rows) {
+    if (st.case_id !== currentCase) {
+      currentCase = st.case_id;
+      const last = await tx.query(`select max(sent_at) as at from scheduled_steps where case_id = $1 and status = 'SENT'`, [st.case_id]);
+      previous = last.rows[0]?.at ? new Date(last.rows[0].at).getTime() : null;
+    }
+    let candidate = Math.max(new Date(st.due_at).getTime(), now.getTime());
+    if (previous !== null) candidate = Math.max(candidate, previous + MIN_GAP_MS);
+    const due = nextWindowInstant(new Date(candidate), window);
+    await tx.query(`update scheduled_steps set status = 'SCHEDULED', skip_reason = null, due_at = $2 where id = $1 and status = 'CANCELED'`, [st.id, due]);
+    previous = due.getTime();
+    perCase.set(st.case_id, (perCase.get(st.case_id) ?? 0) + 1);
+  }
+  for (const [caseId, count] of perCase) {
+    await logAction(tx, { tenantId, caseId, actor: 'system', action: 'steps.rescheduled', details: { count, reason: 'stripe_reconnected' } });
+  }
 }
 
 export type RevokeResult = { status: 'revoked'; tenantId: string } | { status: 'unknown_account' };

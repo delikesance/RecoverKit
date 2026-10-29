@@ -1,10 +1,12 @@
 import type { Metadata } from 'next';
 import { getBillingStatus } from '@recoverkit/services';
 import { loadAppContext } from '@/server/context';
+import { readFlash } from '@/server/flash';
 import { AppShell } from '@/ui/AppShell';
 import { Banners } from '@/ui/Banners';
 import { Chip } from '@/ui/Chip';
 import { Flash } from '@/ui/Flash';
+import { FlashClear } from '@/ui/FlashClear';
 import { formatDateTime, formatMoney } from '@/lib/format';
 import { openPortalAction, startCheckoutAction } from '../actions';
 
@@ -19,8 +21,9 @@ const STATE: Record<string, { label: string; tone: 'success' | 'warning' | 'dang
   CANCELED: { label: 'Abonnement annulé', tone: 'neutral' },
 };
 
-export default async function BillingPage({ searchParams }: { searchParams: Promise<{ status?: string; error?: string }> }) {
+export default async function BillingPage({ searchParams }: { searchParams: Promise<{ status?: string }> }) {
   const sp = await searchParams;
+  const flash = await readFlash('/app/billing');
   const ctx = await loadAppContext();
   const b = await getBillingStatus(ctx.deps, ctx.tenant.id);
   const plans = ctx.deps.config.plans;
@@ -30,7 +33,8 @@ export default async function BillingPage({ searchParams }: { searchParams: Prom
     <AppShell tenantName={ctx.tenant.name} active="billing" activeCases={ctx.activeCases} stripe={ctx.stripe} userEmail={ctx.session.email}>
       <div><h1 className="page-title">Abonnement</h1><p className="page-sub">Votre abonnement RecoverKit.</p></div>
       <Banners alerts={ctx.alerts} />
-      <Flash error={sp.error} />
+      <Flash error={flash?.error} />
+      {flash ? <FlashClear /> : null}
       {sp.status === 'success' ? <div className="banner banner-info" role="status"><span className="grow">Merci ! Votre abonnement est en cours d’activation.</span></div> : null}
       {!b.enabled ? (
         <section className="panel" style={{ padding: 24 }}><p>La facturation n’est pas activée sur cette installation : toutes les fonctionnalités sont disponibles sans abonnement.</p></section>

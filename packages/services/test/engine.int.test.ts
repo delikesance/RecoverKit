@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { getCaseByInvoice, listCaseActions, listStepsForCase, reserveDueSteps } from '@recoverkit/db';
+import { getCaseByInvoice, listCaseActions, listStepsForCase, recoverStaleReservations, reserveDueSteps } from '@recoverkit/db';
 import { FakeMailer, MailerError } from '@recoverkit/mail';
 import { GatewayError } from '@recoverkit/stripe';
-import { createTestDb, type TestDb } from '@recoverkit/testkit';
+import { createTestDb, seedCase, seedTenant, type TestDb } from '@recoverkit/testkit';
+import { handleDeauthorized } from '../src/stripe/connect';
 import { processInbox } from '../src/webhooks/process';
 import { closeExhaustedCases, runDueSteps, sendReservedStep } from '../src/engine/send-steps';
 import { makeDeps, type TestDeps } from './helpers';
@@ -195,6 +196,8 @@ describe('fiabilité : jamais deux envois', () => {
     const keys = mine.map((m) => m.idempotencyKey);
     expect(new Set(keys).size).toBe(keys.length);
     expect(keys.length).toBe(8);
+    // FakeMailer dédoublonne : seul le nombre d'appels à send prouve l'exactly-once
+    for (const k of keys) expect(deps.mailer.callCount(k), `appels à send pour ${k}`).toBe(1);
     expect(a.sent + b.sent).toBeLessThanOrEqual(8);
     expect(tenantIds.size).toBe(8);
   });
@@ -215,6 +218,7 @@ describe('fiabilité : jamais deux envois', () => {
     const second = await runDueSteps(deps);
     expect(second).toMatchObject({ sent: 1 });
     expect(mailer.sent).toHaveLength(1); // toujours un seul email
+    expect(mailer.callCount(`${c.id}:0`)).toBe(2); // 2 appels (renvoi avec la même clé) pour 1 message
     expect(await stepRow(c.id, 0)).toMatchObject({ status: 'SENT', message_id: 'fake_1' });
   });
 
@@ -343,5 +347,237 @@ describe('fin de séquence', () => {
     const c = await withSteps(deps, s, 10);
     await db.pool.query(`update recovery_cases set state = 'PAUSED' where id = $1`, [c.id]);
     expect(await closeExhaustedCases(deps)).toBe(0);
+  });
+});
+
+describe('jamais de rafale', () => {
+  it('étapes 0 à 3 toutes échues (panne du worker) : un seul email par passe, les suivants repoussés d’au moins 12 h', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    await db.pool.query(`update scheduled_steps set due_at = $2 where case_id = $1`, [c.id, new Date(deps.clock.now().getTime() - 3600_000)]);
+
+    expect(await runDueSteps(deps)).toMatchObject({ sent: 1 });
+    expect(deps.mailer.sent).toHaveLength(1);
+    expect(await runDueSteps(deps)).toMatchObject({ sent: 0 }); // l'étape 1 est repoussée, pas envoyée
+    expect(await runDueSteps(deps)).toMatchObject({ sent: 0 });
+    expect(deps.mailer.sent).toHaveLength(1);
+
+    const step1 = await stepRow(c.id, 1);
+    expect(step1.status).toBe('SCHEDULED');
+    const sentAt = (await db.pool.query(`select sent_at from email_messages where case_id = $1`, [c.id])).rows[0].sent_at as Date;
+    expect(new Date(step1.due_at).getTime()).toBeGreaterThanOrEqual(sentAt.getTime() + 12 * 3600_000);
+    expect(step1.attempts).toBe(0); // le report n'est pas une tentative d'envoi
+  });
+
+  it('étape réservée alors qu’un email du dossier est parti il y a moins de 12 h : repoussée dans la fenêtre, pas envoyée', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    const sentAt = new Date(deps.clock.now().getTime() - 3600_000);
+    await db.pool.query(
+      `insert into email_messages (tenant_id, case_id, step_index, idempotency_key, to_email, subject, status, dry_run, sent_at)
+       values ($1,$2,0,$3,'x@example.com','s','SENT',false,$4)`,
+      [s.tenantId, c.id, `${c.id}:0`, sentAt],
+    );
+    await db.pool.query(`update scheduled_steps set status = 'SENT', sent_at = $2 where case_id = $1 and step_index = 0`, [c.id, sentAt]);
+    await db.pool.query(`update scheduled_steps set due_at = $2 where case_id = $1 and step_index = 1`, [c.id, deps.clock.now()]);
+    const [reserved] = await reserveDueSteps(db.pool, deps.clock.now(), 5, { tenantId: s.tenantId });
+    expect(reserved!.stepIndex).toBe(1);
+    expect(await sendReservedStep(deps, reserved!)).toBe('released');
+    expect(deps.mailer.sent).toHaveLength(0);
+    const row = await stepRow(c.id, 1);
+    expect(row.status).toBe('SCHEDULED');
+    expect(new Date(row.due_at).getTime()).toBeGreaterThanOrEqual(sentAt.getTime() + 12 * 3600_000);
+  });
+});
+
+describe('re-vérification sous verrou avant l’envoi', () => {
+  it('dossier clôturé manuellement pendant l’envoi : aucun email, aucun lien de paiement actif', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    const real = deps.stripe.retrieveInvoice.bind(deps.stripe);
+    deps.stripe.retrieveInvoice = async (...a: Parameters<typeof real>) => {
+      const inv = await real(...a);
+      await db.pool.query(`update recovery_cases set state = 'CLOSED_MANUAL' where id = $1`, [c.id]); // le marchand clique « Clôturer »
+      return inv;
+    };
+    expect(await runDueSteps(deps)).toMatchObject({ sent: 0 });
+    expect(deps.mailer.sent).toHaveLength(0);
+    expect((await stepRow(c.id, 0)).status).not.toBe('SENDING');
+    const tokens = await db.pool.query(`select 1 from payment_tokens where case_id = $1 and used_at is null and revoked_at is null`, [c.id]);
+    expect(tokens.rowCount).toBe(0);
+  });
+
+  it('dossier mis en pause pendant l’envoi : étape relâchée, aucun email', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    const real = deps.stripe.retrieveInvoice.bind(deps.stripe);
+    deps.stripe.retrieveInvoice = async (...a: Parameters<typeof real>) => {
+      const inv = await real(...a);
+      await db.pool.query(`update recovery_cases set state = 'PAUSED' where id = $1`, [c.id]);
+      return inv;
+    };
+    expect(await runDueSteps(deps)).toMatchObject({ sent: 0, released: 1 });
+    expect(deps.mailer.sent).toHaveLength(0);
+    expect(await stepRow(c.id, 0)).toMatchObject({ status: 'SCHEDULED', attempts: 0 });
+  });
+
+  it('désinscription pendant l’envoi : aucun email', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    const real = deps.stripe.retrieveInvoice.bind(deps.stripe);
+    deps.stripe.retrieveInvoice = async (...a: Parameters<typeof real>) => {
+      const inv = await real(...a);
+      const e = await db.pool.query(`select e.email from end_customers e join recovery_cases r on r.end_customer_id = e.id where r.id = $1`, [c.id]);
+      await db.pool.query(`insert into suppressions (tenant_id, email, reason) values ($1,$2,'UNSUBSCRIBED')`, [s.tenantId, e.rows[0].email.toLowerCase()]);
+      return inv;
+    };
+    expect(await runDueSteps(deps)).toMatchObject({ sent: 0 });
+    expect(deps.mailer.sent).toHaveLength(0);
+    expect(await stepRow(c.id, 0)).toMatchObject({ status: 'SKIPPED', skip_reason: 'suppressed' });
+  });
+});
+
+describe('fin de séquence : séquence vide', () => {
+  it('dossier RECOVERING sans aucune étape et ouvert depuis plus de 3 jours : LOST', async () => {
+    const deps = makeDeps(db);
+    const t = await seedTenant(db.pool);
+    const c = await seedCase(db.pool, t.id, { failedAt: new Date(deps.clock.now().getTime() - 4 * 86400_000) });
+    expect(await closeExhaustedCases(deps)).toBe(1);
+    expect((await db.pool.query(`select state from recovery_cases where id = $1`, [c.id])).rows[0].state).toBe('LOST');
+  });
+
+  it('dossier sans étape mais récent : reste RECOVERING', async () => {
+    const deps = makeDeps(db);
+    const t = await seedTenant(db.pool);
+    const c = await seedCase(db.pool, t.id, { failedAt: new Date(deps.clock.now().getTime() - 86400_000) });
+    expect(await closeExhaustedCases(deps)).toBe(0);
+    expect((await db.pool.query(`select state from recovery_cases where id = $1`, [c.id])).rows[0].state).toBe('RECOVERING');
+  });
+});
+
+describe('propriété de la réservation', () => {
+  it('réservation périmée reprise par un autre worker : l’ancien worker n’envoie rien', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    const [first] = await reserveDueSteps(db.pool, deps.clock.now(), 5, { tenantId: s.tenantId });
+    expect(first).toBeDefined(); // worker A réserve puis traîne (lot long)
+    deps.clock.advance({ minutes: 11 });
+    await recoverStaleReservations(db.pool, deps.clock.now(), 10 * 60_000); // worker B reprend la main
+    const [second] = await reserveDueSteps(db.pool, deps.clock.now(), 5, { tenantId: s.tenantId });
+    expect(second!.id).toBe(first!.id);
+
+    expect(await sendReservedStep(deps, first!)).toBe('released'); // A a perdu sa réservation
+    expect(deps.mailer.sent).toHaveLength(0);
+    expect(await stepRow(c.id, 0)).toMatchObject({ status: 'SENDING' }); // l'étape appartient à B
+    expect(await sendReservedStep(deps, second!)).toBe('sent');
+    expect(deps.mailer.sent).toHaveLength(1);
+  });
+});
+
+describe('erreur inattendue avant la transaction d’envoi', () => {
+  const breakLinks = (deps: TestDeps) => {
+    deps.config = { ...deps.config, tokenSecret: undefined as any };
+  };
+
+  it('l’étape est remise en file avec délai (tentative comptée), le dossier n’est pas bloqué', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    const good = deps.config;
+    breakLinks(deps);
+    expect(await runDueSteps(deps)).toMatchObject({ sent: 0, released: 1 });
+    const row = await stepRow(c.id, 0);
+    expect(row).toMatchObject({ status: 'SCHEDULED', attempts: 1 });
+    expect(new Date(row.due_at).getTime()).toBeGreaterThan(deps.clock.now().getTime());
+    expect((await listCaseActions(db.pool, s.tenantId, c.id)).map((a) => a.action)).toContain('email.retry_scheduled');
+
+    deps.config = good;
+    deps.clock.advance({ minutes: 6 });
+    expect(await runDueSteps(deps)).toMatchObject({ sent: 1 });
+  });
+
+  it('au-delà de MAX_SEND_ATTEMPTS : FAILED avec alerte', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    breakLinks(deps);
+    for (let i = 0; i < 3; i++) {
+      await runDueSteps(deps);
+      deps.clock.advance({ minutes: 40 });
+    }
+    expect(await stepRow(c.id, 0)).toMatchObject({ status: 'FAILED', skip_reason: 'send_failed' });
+    expect(deps.mailer.sent).toHaveLength(0);
+  });
+
+  it('recoverStaleReservations respecte le plafond de tentatives', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    await db.pool.query(`update scheduled_steps set status = 'SENDING', attempts = 3, reserved_at = $2 where case_id = $1 and step_index = 0`, [c.id, new Date(deps.clock.now().getTime() - 20 * 60_000)]);
+    await runDueSteps(deps);
+    expect(await stepRow(c.id, 0)).toMatchObject({ status: 'FAILED' });
+    expect(deps.mailer.sent).toHaveLength(0);
+  });
+});
+
+describe('sorties de la garde journalisées', () => {
+  const actionsOf = async (s: Scenario, caseId: string) => listCaseActions(db.pool, s.tenantId, caseId);
+
+  it('dossier clos : email.canceled avec stepIndex et reason', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    const [reserved] = await reserveDueSteps(db.pool, deps.clock.now(), 5, { tenantId: s.tenantId });
+    await db.pool.query(`update recovery_cases set state = 'RECOVERED' where id = $1`, [c.id]);
+    await sendReservedStep(deps, reserved!);
+    const a = (await actionsOf(s, c.id)).find((x) => x.action === 'email.canceled');
+    expect(a?.details).toMatchObject({ stepIndex: 0, reason: 'case_closed' });
+  });
+
+  it('désinscrit : email.skipped ; dossier en pause : email.released', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    const [reserved] = await reserveDueSteps(db.pool, deps.clock.now(), 5, { tenantId: s.tenantId });
+    await db.pool.query(`update recovery_cases set state = 'PAUSED' where id = $1`, [c.id]);
+    await sendReservedStep(deps, reserved!);
+    expect((await actionsOf(s, c.id)).find((x) => x.action === 'email.released')?.details).toMatchObject({ stepIndex: 0, reason: 'case_not_recovering' });
+
+    const s2 = await setupScenario(db, deps);
+    const c2 = await openCase(deps, s2);
+    const e = await db.pool.query(`select e.email from end_customers e join recovery_cases r on r.end_customer_id = e.id where r.id = $1`, [c2.id]);
+    await db.pool.query(`insert into suppressions (tenant_id, email, reason) values ($1,$2,'UNSUBSCRIBED')`, [s2.tenantId, e.rows[0].email.toLowerCase()]);
+    await runDueSteps(deps);
+    expect((await actionsOf(s2, c2.id)).find((x) => x.action === 'email.skipped')?.details).toMatchObject({ stepIndex: 0, reason: 'suppressed' });
+  });
+
+  it('connexion révoquée : email.canceled(stripe_revoked)', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    const [reserved] = await reserveDueSteps(db.pool, deps.clock.now(), 5, { tenantId: s.tenantId });
+    await db.pool.query(`update stripe_connections set status = 'REVOKED' where tenant_id = $1`, [s.tenantId]);
+    await sendReservedStep(deps, reserved!);
+    expect((await actionsOf(s, c.id)).find((x) => x.action === 'email.canceled')?.details).toMatchObject({ stepIndex: 0, reason: 'stripe_revoked' });
+  });
+});
+
+describe('fin de séquence et révocation Stripe', () => {
+  it('les relances annulées par une révocation ne font pas passer le dossier en LOST (il reste replanifiable à la reconnexion)', async () => {
+    const deps = makeDeps(db);
+    const s = await setupScenario(db, deps);
+    const c = await openCase(deps, s);
+    await handleDeauthorized(deps, s.account);
+    deps.clock.advance({ days: 30 }); // bien après la dernière échéance + délai de grâce
+    await closeExhaustedCases(deps); // d'autres dossiers de la base partagée peuvent être clos : on ne regarde que celui-ci
+    expect((await getCaseByInvoice(db.pool, s.tenantId, s.invoiceId))!.state).toBe('RECOVERING');
+    // les étapes restent annulées pour 'stripe_revoked' : la reconnexion les replanifie (rescheduleRevokedSteps, dossiers RECOVERING)
+    expect((await stepRow(c.id, 0)).skip_reason).toBe('stripe_revoked');
   });
 });

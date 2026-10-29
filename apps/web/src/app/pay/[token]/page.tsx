@@ -4,6 +4,7 @@ import { payMessage, resolvePaymentLink } from '@recoverkit/services';
 import { PayForm } from '@/ui/pay/PayForm';
 import { PayCard } from '@/ui/pay/PayCard';
 import { getDeps } from '@/server/runtime';
+import { clientIp } from '@/server/http';
 
 export const metadata: Metadata = { title: 'Mettre à jour votre paiement', robots: { index: false, follow: false } };
 export const dynamic = 'force-dynamic';
@@ -11,8 +12,9 @@ export const dynamic = 'force-dynamic';
 export default async function PayPage({ params }: { params: Promise<{ token: string }> }) {
   const { token } = await params;
   const h = await headers();
-  const ip = h.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
-  const r = await resolvePaymentLink(getDeps(), token, { ip });
+  const deps = getDeps();
+  const ip = clientIp(h, deps.config.trustedProxyHops);
+  const r = await resolvePaymentLink(deps, token, { ip });
 
   if (r.status !== 'ok') {
     const key = r.status === 'paid' ? 'paid' : r.status === 'rate_limited' ? 'rate_limited' : 'unavailable';

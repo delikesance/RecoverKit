@@ -1,9 +1,11 @@
 import type { Metadata } from 'next';
-import { getOnboardingStatus } from '@recoverkit/services';
+import { DEFAULT_TENANT_NAME, getOnboardingStatus } from '@recoverkit/services';
 import { loadAppContext } from '@/server/context';
+import { readFlash } from '@/server/flash';
 import { AppShell } from '@/ui/AppShell';
 import { Flash } from '@/ui/Flash';
-import { acknowledgeNativeEmailsAction, confirmSenderAction, sendTestEmailAction, setDryRunAction } from '../actions';
+import { FlashClear } from '@/ui/FlashClear';
+import { acknowledgeNativeEmailsAction, confirmSenderAction, saveCompanyNameAction, sendTestEmailAction, setDryRunAction } from '../actions';
 
 export const metadata: Metadata = { title: 'Mise en route' };
 export const dynamic = 'force-dynamic';
@@ -16,8 +18,9 @@ const STRIPE_MESSAGES: Record<string, { tone: 'info' | 'critical'; text: string 
   taken: { tone: 'critical', text: 'Ce compte Stripe est déjà relié à un autre compte RecoverKit.' },
 };
 
-export default async function OnboardingPage({ searchParams }: { searchParams: Promise<{ stripe?: string; notice?: string; error?: string }> }) {
+export default async function OnboardingPage({ searchParams }: { searchParams: Promise<{ stripe?: string; notice?: string }> }) {
   const sp = await searchParams;
+  const flash = await readFlash('/app/onboarding');
   const ctx = await loadAppContext();
   const status = await getOnboardingStatus(ctx.deps, ctx.tenant.id);
   const done = Object.fromEntries(status.steps.map((s) => [s.key, s.done])) as Record<string, boolean>;
@@ -26,6 +29,7 @@ export default async function OnboardingPage({ searchParams }: { searchParams: P
   const num = (n: number, key: string) => (
     <span className="av" style={done[key] ? { background: 'var(--green)', color: '#fff' } : current === key ? { background: 'var(--blue)', color: '#fff' } : undefined} aria-hidden="true">{done[key] ? '✓' : n}</span>
   );
+  const nameSet = ctx.tenant.name.trim().toLowerCase() !== DEFAULT_TENANT_NAME.toLowerCase();
   const hasTest = !!(await ctx.deps.pool.query(`select onboarding->>'testEmailSentAt' as t from tenants where id = $1`, [ctx.tenant.id])).rows[0]?.t;
 
   return (
@@ -34,7 +38,8 @@ export default async function OnboardingPage({ searchParams }: { searchParams: P
         <h1 className="page-title">Mise en route</h1>
         <p className="page-sub">Quatre étapes pour que vos paiements échoués soient relancés automatiquement.</p>
       </div>
-      <Flash notice={sp.notice} error={sp.error} />
+      <Flash notice={sp.notice} error={flash?.error} />
+      {flash ? <FlashClear /> : null}
       {stripeMsg ? <div className={`banner banner-${stripeMsg.tone}`} role={stripeMsg.tone === 'critical' ? 'alert' : 'status'}><span className="grow">{stripeMsg.text}</span></div> : null}
 
       <ol className="stack" style={{ listStyle: 'none', margin: 0, padding: 0, gap: 16, maxWidth: 760 }}>
@@ -67,10 +72,18 @@ export default async function OnboardingPage({ searchParams }: { searchParams: P
         <li className="panel" style={{ padding: 24 }} aria-current={current === 'activate' ? 'step' : undefined}>
           <div className="row" style={{ gap: 16 }}>{num(4, 'activate')}<h2 className="section-title">Tester, puis activer</h2></div>
           <p className="muted" style={{ margin: '12px 0 16px 52px' }}>En mode test, RecoverKit enregistre ce qui serait envoyé sans écrire à vos clients. Envoyez-vous d’abord un email de test, puis activez les vrais envois.</p>
+          <form action={saveCompanyNameAction} className="row wrap" style={{ margin: '0 0 16px 52px', gap: 12, alignItems: 'flex-end' }}>
+            <div style={{ flex: '1 1 260px', maxWidth: 380 }}>
+              <label htmlFor="company-name" className="label">Nom affiché à vos clients</label>
+              <input id="company-name" name="name" className="field" required maxLength={80} defaultValue={nameSet ? ctx.tenant.name : ''} placeholder="Nimbus Notes" autoComplete="organization" aria-describedby="company-name-hint" />
+            </div>
+            <button type="submit" className="btn btn-s">Enregistrer le nom</button>
+            <p id="company-name-hint" className="hint" style={{ flexBasis: '100%', margin: 0 }}>Il apparaît dans l’objet et la signature des emails, et sur la page de paiement. {nameSet ? '' : 'Il est requis pour activer les relances.'}</p>
+          </form>
           <div className="row wrap" style={{ marginLeft: 52, gap: 12 }}>
             <form action={sendTestEmailAction}><input type="hidden" name="stepIndex" value="0" /><input type="hidden" name="locale" value="fr" /><input type="hidden" name="from" value="onboarding" /><button type="submit" className="btn btn-s" disabled={!done.native_emails}>M’envoyer un email de test</button></form>
             {done.activate ? <span className="chip chip-success">Relances actives</span> : (
-              <form action={setDryRunAction}><input type="hidden" name="mode" value="live" /><input type="hidden" name="from" value="onboarding" /><button type="submit" className="btn btn-p" disabled={!done.native_emails || !hasTest}>Activer les relances</button></form>
+              <form action={setDryRunAction}><input type="hidden" name="mode" value="live" /><input type="hidden" name="from" value="onboarding" /><button type="submit" className="btn btn-p" disabled={!done.native_emails || !hasTest || !nameSet}>Activer les relances</button></form>
             )}
           </div>
           {done.native_emails && !hasTest && !done.activate ? <p className="hint" style={{ marginLeft: 52 }}>Envoyez-vous l’email de test pour débloquer l’activation.</p> : null}

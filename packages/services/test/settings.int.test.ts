@@ -97,6 +97,34 @@ describe('éditeur de modèles', () => {
     expect((await getTemplates(deps, t.id, 'en'))[0]!.isCustom).toBe(false);
   });
 
+  it('séquence de 6 étapes : étapes 4 et 5 intermédiaires, « dernier avis » seulement pour la dernière', async () => {
+    const deps = makeDeps(db);
+    const t = await newTenant();
+    await saveSequence(deps, t.id, Array.from({ length: 6 }, (_, i) => ({ delayMinutes: 60 * (i + 1), active: true })));
+    for (const locale of ['fr', 'en'] as const) {
+      const tpl = await getTemplates(deps, t.id, locale);
+      expect(tpl).toHaveLength(6);
+      const subjects = tpl.map((x) => x.subject);
+      expect(new Set(subjects).size).toBe(6);
+      const final = /dernier avis|final notice/i;
+      const last = /dernier message|last message/i;
+      for (const i of [0, 1, 2, 3, 4]) {
+        expect(tpl[i]!.subject).not.toMatch(final);
+        expect(tpl[i]!.body).not.toMatch(last);
+      }
+      expect(tpl[5]!.subject).toMatch(final);
+      expect(tpl[5]!.body).toMatch(last);
+    }
+  });
+
+  it('séquence de 4 étapes ou moins : comportement inchangé (dernier avis à l’index 3)', async () => {
+    const deps = makeDeps(db);
+    const t = await newTenant();
+    const tpl = await getTemplates(deps, t.id, 'fr');
+    expect(tpl).toHaveLength(4);
+    expect(tpl[3]!.subject).toMatch(/dernier avis/i);
+  });
+
   it('refuse un modèle invalide avec le détail de l’erreur', async () => {
     const deps = makeDeps(db);
     const t = await newTenant();

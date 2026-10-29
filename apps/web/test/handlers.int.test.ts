@@ -10,7 +10,7 @@ import { handlePaySetup } from '../src/server/handlers/pay';
 import { handleUnsubscribe } from '../src/server/handlers/unsubscribe';
 import { handleExportData, handleExportRecovered } from '../src/server/handlers/exports';
 import { handleHealth, handleHealthDetails } from '../src/server/handlers/health';
-import { clientIp } from '../src/server/http';
+import { clientIp, getCookie, safeNextPath } from '../src/server/http';
 
 let db: TestDb;
 let deps: TestDeps;
@@ -40,10 +40,79 @@ beforeAll(() => {
 });
 
 describe('clientIp', () => {
-  it('prend la première adresse de x-forwarded-for, sinon « unknown »', () => {
-    expect(clientIp(new Request(APP, { headers: { 'x-forwarded-for': '203.0.113.5, 10.0.0.1' } }))).toBe('203.0.113.5');
-    expect(clientIp(new Request(APP, { headers: { 'x-real-ip': '198.51.100.2' } }))).toBe('198.51.100.2');
+  const h = (headers: Record<string, string>) => new Request(APP, { headers });
+  it('prend l’entrée ajoutée par notre proxy (la dernière), pas celle du client', () => {
+    expect(clientIp(h({ 'x-forwarded-for': '203.0.113.5' }))).toBe('203.0.113.5');
+    expect(clientIp(h({ 'x-forwarded-for': '1.2.3.4, 203.0.113.5' }))).toBe('203.0.113.5');
+  });
+  it('un en-tête forgé par le client ne change pas l’adresse retenue', () => {
+    const a = clientIp(h({ 'x-forwarded-for': '1.1.1.1, 198.51.100.9' }));
+    const b = clientIp(h({ 'x-forwarded-for': '2.2.2.2, 3.3.3.3, 198.51.100.9' }));
+    expect(a).toBe('198.51.100.9');
+    expect(b).toBe('198.51.100.9');
+  });
+  it('plusieurs sauts de confiance : N-ième entrée depuis la droite', () => {
+    const req = h({ 'x-forwarded-for': '9.9.9.9, 203.0.113.5, 10.0.0.1' });
+    expect(clientIp(req, 2)).toBe('203.0.113.5');
+    expect(clientIp(req, 3)).toBe('9.9.9.9');
+  });
+  it('liste plus courte que TRUSTED_PROXY_HOPS : en-tête ignoré (jamais parts[0]), « unknown »', () => {
+    expect(clientIp(h({ 'x-forwarded-for': '6.6.6.6' }), 2)).toBe('unknown');
+    expect(clientIp(h({ 'x-forwarded-for': '6.6.6.6, 203.0.113.5' }), 3)).toBe('unknown');
+    expect(clientIp(h({ 'x-forwarded-for': '9.9.9.9, 203.0.113.5, 10.0.0.1' }), 10)).toBe('unknown');
+  });
+  it('accepte des Headers (pages serveur) ; x-real-ip ignoré par défaut, lu seulement si le drapeau l’autorise', () => {
+    expect(clientIp(new Headers({ 'x-forwarded-for': 'a, 203.0.113.7' }))).toBe('203.0.113.7');
+    expect(clientIp(h({ 'x-real-ip': '198.51.100.2' }), 1, { trustRealIp: false })).toBe('unknown');
+    expect(clientIp(h({ 'x-real-ip': '198.51.100.2' }), 1, { trustRealIp: true })).toBe('198.51.100.2');
+    expect(clientIp(new Request(APP), 1, { trustRealIp: true })).toBe('unknown');
     expect(clientIp(new Request(APP))).toBe('unknown');
+  });
+  it('x-real-ip autorisé ne remplace pas un X-Forwarded-For valide', () => {
+    expect(clientIp(h({ 'x-forwarded-for': '203.0.113.5', 'x-real-ip': '1.1.1.1' }), 1, { trustRealIp: true })).toBe('203.0.113.5');
+  });
+});
+
+describe('getCookie', () => {
+  it('renvoie null pour un cookie mal encodé au lieu de lever', () => {
+    expect(getCookie(new Request(APP, { headers: { cookie: 'rk_session=%E0%A4%A' } }), 'rk_session')).toBeNull();
+    expect(getCookie(new Request(APP, { headers: { cookie: 'rk_session=ab%20c' } }), 'rk_session')).toBe('ab c');
+  });
+  it('logout avec un cookie invalide ne plante pas', async () => {
+    const r = await handleLogout(deps, post('/api/auth/logout', '', { cookie: 'rk_session=%E0%A4%A' }));
+    expect(r.status).toBe(303);
+  });
+});
+
+describe('safeNextPath (anti open-redirect)', () => {
+  it.each(['/app', '/app/cases/1', '/app/cases/1?tab=timeline', '/app?x=1'])('accepte %s', (p) => expect(safeNextPath(p)).toBe(p));
+  it.each([
+    'https://evil.example', '//evil.example', '/\\evil.example', '/app/../login', '/apple', '/login', 'app', '', '/app//x@evil', '/app\n/x', 'javascript:alert(1)', '/app/%2e%2e/x',
+  ])('refuse %j', (p) => expect(safeNextPath(p)).toBeNull());
+  it('null et undefined', () => {
+    expect(safeNextPath(null)).toBeNull();
+    expect(safeNextPath(undefined)).toBeNull();
+  });
+});
+
+describe('next après connexion', () => {
+  async function consumeWith(email: string, ip: string, cookie?: string) {
+    await requestLoginLink(deps, email, { ip });
+    const token = deps.mailer.messagesTo(email).at(-1)!.text.match(/token=([\w-]+)/)![1]!;
+    return handleAuthConsume(deps, post('/auth/verify', form({ token }), cookie ? { cookie } : {}));
+  }
+  it('honore le chemin interne posé par le proxy et efface le cookie', async () => {
+    const r = await consumeWith('next1@example.com', '203.0.113.70', `rk_next=${encodeURIComponent('/app/cases/abc?tab=timeline')}`);
+    expect(r.headers.get('location')).toBe(`${APP}/app/cases/abc?tab=timeline`);
+    expect(r.headers.getSetCookie().some((c) => c.startsWith('rk_next=') && /Max-Age=0/i.test(c))).toBe(true);
+  });
+  it.each(['https://evil.example', '//evil.example', '/\\evil.example', '/login'])('ignore un next hostile %s', async (bad) => {
+    const r = await consumeWith(`bad${Math.random()}@example.com`, '203.0.113.71', `rk_next=${encodeURIComponent(bad)}`);
+    expect(r.headers.get('location')).toBe(`${APP}/app/onboarding`);
+  });
+  it('ignore un cookie rk_next mal encodé', async () => {
+    const r = await consumeWith('next3@example.com', '203.0.113.72', 'rk_next=%E0%A4%A');
+    expect(r.headers.get('location')).toBe(`${APP}/app/onboarding`);
   });
 });
 
@@ -73,7 +142,13 @@ describe('webhooks', () => {
     const raw = JSON.stringify({ type: 'email.delivered', data: { email_id: 'inconnu' } });
     const ts = String(Math.floor(deps.clock.now().getTime() / 1000));
     const sig = 'v1,' + createHmac('sha256', Buffer.from('resend-webhook-secret-for-tests')).update(`msg_h1.${ts}.${raw}`).digest('base64');
-    const ok = await handleResendWebhook(deps, new Request(`${APP}/api/resend/webhook`, { method: 'POST', body: raw, headers: { 'svix-id': 'msg_h1', 'svix-timestamp': ts, 'svix-signature': sig } }));
+    // Évènement récent pour un email pas encore enregistré : 503 pour que Resend réessaie.
+    const retry = await handleResendWebhook(deps, new Request(`${APP}/api/resend/webhook`, { method: 'POST', body: raw, headers: { 'svix-id': 'msg_h1', 'svix-timestamp': ts, 'svix-signature': sig } }));
+    expect(retry.status).toBe(503);
+    // Évènement ancien (> 24 h) pour un message inconnu : étranger, 200 sans réessai.
+    const oldRaw = JSON.stringify({ type: 'email.delivered', created_at: '2026-10-20T10:00:00Z', data: { email_id: 'inconnu' } });
+    const oldSig = 'v1,' + createHmac('sha256', Buffer.from('resend-webhook-secret-for-tests')).update(`msg_h3.${ts}.${oldRaw}`).digest('base64');
+    const ok = await handleResendWebhook(deps, new Request(`${APP}/api/resend/webhook`, { method: 'POST', body: oldRaw, headers: { 'svix-id': 'msg_h3', 'svix-timestamp': ts, 'svix-signature': oldSig } }));
     expect(ok.status).toBe(200);
     const bad = await handleResendWebhook(deps, new Request(`${APP}/api/resend/webhook`, { method: 'POST', body: raw, headers: { 'svix-id': 'msg_h2', 'svix-timestamp': ts, 'svix-signature': 'v1,faux' } }));
     expect(bad.status).toBe(400);
@@ -259,6 +334,53 @@ describe('exports', () => {
   it('CSV : paramètres invalides refusés', async () => {
     const s = await login('export2@example.com');
     expect((await handleExportRecovered(deps, get('/api/app/export/recovered?year=abc&month=13', { cookie: s.cookie }))).status).toBe(400);
+  });
+
+  it('CSV : paramètre currency filtre les lignes et la devise invalide est refusée', async () => {
+    const s = await login('export-cur@example.com');
+    const c = await seedCase(db.pool, s.tenantId, {});
+    for (const [inv, cur, amt] of [['in_eur', 'EUR', 1000], ['in_usd', 'USD', 2000]] as const) {
+      await db.pool.query(
+        `insert into recovery_ledger (tenant_id, case_id, invoice_id, kind, attribution, amount, currency, occurred_at) values ($1,$2,$3,'RECOVERY','ASSISTED',$4,$5,$6)`,
+        [s.tenantId, c.id, inv, amt, cur, new Date('2026-10-15T10:00:00Z')],
+      );
+    }
+    const usd = await (await handleExportRecovered(deps, get('/api/app/export/recovered?year=2026&month=10&currency=usd', { cookie: s.cookie }))).text();
+    expect(usd).toContain('in_usd');
+    expect(usd).not.toContain('in_eur');
+    const all = await (await handleExportRecovered(deps, get('/api/app/export/recovered?year=2026&month=10', { cookie: s.cookie }))).text();
+    expect(all).toContain('in_usd');
+    expect(all).toContain('in_eur');
+    expect((await handleExportRecovered(deps, get('/api/app/export/recovered?year=2026&month=10&currency=%27%3B', { cookie: s.cookie }))).status).toBe(400);
+  });
+
+  it('CSV : débit limité par tenant (429 + retry-after), un autre tenant n’est pas affecté', async () => {
+    const s = await login('export-csv-rl@example.com');
+    let last = 200;
+    for (let i = 0; i < 31; i++) {
+      const r = await handleExportRecovered(deps, get('/api/app/export/recovered?year=2026&month=10', { cookie: s.cookie }));
+      last = r.status;
+      if (r.status === 200) await r.body?.cancel();
+    }
+    expect(last).toBe(429);
+    const o = await login('export-csv-rl2@example.com');
+    expect((await handleExportRecovered(deps, get('/api/app/export/recovered?year=2026&month=10', { cookie: o.cookie }))).status).toBe(200);
+  });
+
+  it('export des données : acteur user:<id> journalisé et débit limité', async () => {
+    const s = await login('export-rl@example.com');
+    const uid = (await db.pool.query(`select id from users where email = $1`, ['export-rl@example.com'])).rows[0].id as string;
+    expect((await handleExportData(deps, get('/api/app/export/data', { cookie: s.cookie }))).status).toBe(200);
+    const log = await db.pool.query(`select actor from action_log where tenant_id = $1 and action = 'tenant.exported'`, [s.tenantId]);
+    expect(log.rows.map((r) => r.actor)).toEqual([`user:${uid}`]);
+    let last = 200;
+    for (let i = 0; i < 6; i++) last = (await handleExportData(deps, get('/api/app/export/data', { cookie: s.cookie }))).status;
+    expect(last).toBe(429);
+    const n = await db.pool.query(`select count(*)::int n from action_log where tenant_id = $1 and action = 'tenant.exported'`, [s.tenantId]);
+    expect(n.rows[0].n).toBeLessThan(7);
+    // un autre tenant n'est pas affecté
+    const o = await login('export-rl2@example.com');
+    expect((await handleExportData(deps, get('/api/app/export/data', { cookie: o.cookie }))).status).toBe(200);
   });
 
   it('export des données : JSON en pièce jointe, limité au tenant connecté', async () => {

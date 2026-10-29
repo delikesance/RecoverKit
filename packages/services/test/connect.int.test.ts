@@ -147,6 +147,39 @@ describe('révocation', () => {
     expect(n.rows[0].n).toBe(1);
   });
 
+  it('reconnexion : l’alerte stripe_revoked est résolue et une seconde révocation en lève une nouvelle', async () => {
+    const { deps, s } = await connected('rev5@example.com', 'acct_rev5');
+    const openAlerts = async () =>
+      (await db.pool.query(`select count(*)::int n from system_alerts where tenant_id = $1 and kind = 'stripe_revoked' and resolved_at is null`, [s.tenantId])).rows[0].n;
+    await handleDeauthorized(deps, 'acct_rev5');
+    expect(await openAlerts()).toBe(1);
+    deps.stripe.setOAuthCode('again5', { stripeUserId: 'acct_rev5', livemode: false });
+    const state = new URL(await buildConnectUrl(deps, s)).searchParams.get('state')!;
+    await handleOAuthCallback(deps, s, { code: 'again5', state });
+    expect(await openAlerts()).toBe(0);
+    await handleDeauthorized(deps, 'acct_rev5');
+    expect(await openAlerts()).toBe(1);
+  });
+
+  it('reconnexion : les étapes annulées par la révocation sont replanifiées (pas de dossier muet puis LOST)', async () => {
+    const { deps, s } = await connected('rev6@example.com', 'acct_rev6');
+    const c = await seedCase(db.pool, s.tenantId, { state: 'RECOVERING' });
+    const past = new Date(deps.clock.now().getTime() - 2 * 86400_000);
+    const sent = await seedStep(db.pool, c.id, s.tenantId, { stepIndex: 0, status: 'SENT', dueAt: past });
+    const cancelled = await seedStep(db.pool, c.id, s.tenantId, { stepIndex: 1, status: 'SCHEDULED', dueAt: past });
+    await handleDeauthorized(deps, 'acct_rev6');
+    deps.stripe.setOAuthCode('again6', { stripeUserId: 'acct_rev6', livemode: false });
+    const state = new URL(await buildConnectUrl(deps, s)).searchParams.get('state')!;
+    await handleOAuthCallback(deps, s, { code: 'again6', state });
+
+    const row = (await db.pool.query(`select status, skip_reason, due_at from scheduled_steps where id = $1`, [cancelled.id])).rows[0];
+    expect(row).toMatchObject({ status: 'SCHEDULED', skip_reason: null });
+    expect(new Date(row.due_at).getTime()).toBeGreaterThanOrEqual(deps.clock.now().getTime());
+    expect((await db.pool.query(`select status from scheduled_steps where id = $1`, [sent.id])).rows[0].status).toBe('SENT');
+    const log = await db.pool.query(`select action from action_log where case_id = $1`, [c.id]);
+    expect(log.rows.map((r) => r.action)).toContain('steps.rescheduled');
+  });
+
   it('un autre compte Stripe pour le même tenant remplace la connexion', async () => {
     const { deps, s } = await connected('rev4@example.com', 'acct_rev4a');
     deps.stripe.setOAuthCode('other', { stripeUserId: 'acct_rev4b', livemode: false });

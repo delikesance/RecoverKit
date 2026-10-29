@@ -9,8 +9,23 @@
 
 Variables : voir `packages/services/src/config.ts` (`DATABASE_URL`, `APP_URL`, clés Stripe et Resend, `TOKEN_SECRET`, `PLANS`, …). Ne jamais définir `RECOVERKIT_E2E` en production.
 
+Variables optionnelles supplémentaires (lues dans `packages/services/src/config.ts`) :
+
+| Variable | Rôle |
+|---|---|
+| `TRUSTED_PROXY_HOPS` | nombre de reverse proxies de confiance devant l'application (entier ≥ 1, défaut 1) ; sert à lire la bonne adresse IP dans `X-Forwarded-For` : le proxy doit **AJOUTER** l'IP réelle du client **à droite** de `X-Forwarded-For` (et non la remplacer ni la laisser en tête), car l'application lit l'entrée située `TRUSTED_PROXY_HOPS` positions avant la fin |
+| `LEGAL_COMPANY_NAME` | raison sociale de l'éditeur (mentions légales) |
+| `LEGAL_ADDRESS` | adresse du siège |
+| `LEGAL_PUBLISHER` | directeur de la publication |
+| `LEGAL_HOST_NAME` | nom de l'hébergeur |
+| `LEGAL_HOST_ADDRESS` | adresse de l'hébergeur |
+| `LEGAL_CONTACT_EMAIL` | adresse de contact (email valide) |
+| `LEGAL_DPO_EMAIL` | contact données personnelles / DPO (email valide) |
+
+Les variables `LEGAL_*` sont optionnelles pour démarrer mais **doivent être renseignées avant le lancement public** : sans elles, les pages mentions légales et confidentialité sont incomplètes, et un **avertissement est journalisé au démarrage en production** si des `LEGAL_*` sont absentes.
+
 ## Image Docker tout-en-un
-Publiée par `.github/workflows/docker.yml` sur `ghcr.io/<propriétaire>/<dépôt>` (`latest` sur `main`, `sha-…`, versions `v*`). Elle contient PostgreSQL 16, le site et le worker, supervisés par `docker/entrypoint.sh`.
+Publiée par `.github/workflows/docker.yml` sur `ghcr.io/<propriétaire>/<dépôt>` (`latest` sur `main` seulement si le commit est encore le tip de `main` au moment de la publication, `sha-…`, versions `v*`), uniquement une fois le workflow `CI` réussi sur ce commit ou ce tag (sur les PR : construction et test de fumée sans publication). Elle contient PostgreSQL 16, le site et le worker, supervisés par `docker/entrypoint.sh`.
 
 ```bash
 docker run -d --name recoverkit -p 8080:3000 -v recoverkit-data:/var/lib/postgresql/data \
@@ -21,6 +36,7 @@ docker run -d --name recoverkit -p 8080:3000 -v recoverkit-data:/var/lib/postgre
 - **Un seul port : 3000, HTTP.** Le HTTPS se termine sur votre reverse proxy, qui doit transmettre `Host`, `Origin` et `X-Forwarded-For` tels quels. `APP_URL` doit être l'URL publique en `https://`.
 - **Volume obligatoire** sur `/var/lib/postgresql/data` : sans lui, la base disparaît avec le conteneur. Il contient aussi le mot de passe interne de la base et, à défaut de `TOKEN_SECRET` fourni, un secret généré (à fournir explicitement en production).
 - PostgreSQL n'écoute que sur `127.0.0.1` dans le conteneur. Les migrations s'appliquent à chaque démarrage. Une seule instance par volume.
+- Initialisation : le marqueur `.recoverkit-initialized` du volume n'est écrit qu'après la création du rôle et de la base ; un arrêt pendant le premier démarrage est repris au redémarrage suivant. Un volume sans marqueur ni secrets dont le cluster est inutilisable et ne contient aucune base utilisateur est régénéré ; un cluster contenant la base `recoverkit` n'est jamais détruit. Si le marqueur existe mais que `.recoverkit-secrets` a disparu, le conteneur refuse de démarrer (restaurer le volume). Tests : `scripts/test-entrypoint.sh` (sans Docker).
 - Sauvegarde : `docker exec recoverkit pg_dump -h /tmp -U postgres recoverkit > sauvegarde.sql`.
 - Si la base, le site ou le worker s'arrête, le conteneur s'arrête (utiliser `--restart unless-stopped`).
 
@@ -54,6 +70,14 @@ docker run -d --name recoverkit -p 8080:3000 -v recoverkit-data:/var/lib/postgre
 - [ ] `STRIPE_PUBLISHABLE_KEY` renseignée (sinon la page de paiement client ne peut pas afficher de formulaire de carte).
 - [ ] Domaine d'envoi vérifié chez Resend (SPF, DKIM, DMARC) ; `RESEND_WEBHOOK_SECRET` défini.
 - [ ] `PLANS` renseigné, correspondant aux prix Stripe de la plateforme.
-- [ ] Mentions légales et politique de confidentialité complétées (`apps/web/src/app/mentions-legales`, `confidentialite`).
+- [ ] Variables `LEGAL_*` renseignées (voir plus haut) et pages mentions légales / confidentialité relues (`apps/web/src/app/mentions-legales`, `confidentialite`). `TRUSTED_PROXY_HOPS` correspond au nombre réel de proxies.
 - [ ] `RECOVERKIT_E2E` absent. `ADMIN_TOKEN` défini.
 - [ ] Parcours manuel en mode test Stripe : `stripe listen --forward-to <APP_URL>/api/stripe/webhook`, `stripe trigger invoice.payment_failed`, email en dry-run puis réel vers une boîte de test, carte `4242 4242 4242 4242` sur `/pay/…`, vérifier `invoice.paid` → dossier `RECOVERED` + ligne au ledger. (Non réalisé dans cet environnement : Stripe.js réel et 3-D Secure ne sont pas couverts par les tests automatiques.)
+
+## Passage manuel en mode test Stripe
+Aucun interrupteur automatique : on bascule en remplaçant les clés par celles du mode test, sur une instance (et un volume) de recette, jamais sur la production.
+1. Dans le tableau de bord Stripe, passer en mode test et relever : clé secrète `sk_test_…`, clé publiable `pk_test_…`, identifiant Connect `ca_…` (mode test), secrets de webhook `whsec_…` (Connect et plateforme, créés sur les endpoints de test).
+2. Renseigner `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_CONNECT_CLIENT_ID`, `STRIPE_CONNECT_WEBHOOK_SECRET` et `STRIPE_PLATFORM_WEBHOOK_SECRET` avec ces valeurs, puis redémarrer le conteneur (la configuration est lue au démarrage).
+3. Utiliser une base de recette : les données créées en mode test ne doivent pas se mélanger à celles de production dans `recovery_ledger` (ajout seul, non corrigeable par UPDATE).
+4. Dérouler le parcours de la checklist ci-dessous (`stripe listen`, `stripe trigger invoice.payment_failed`, carte `4242 4242 4242 4242`), emails vers une boîte de test.
+5. Retour en production : remettre les clés live et redémarrer ; ne jamais réutiliser le volume de recette.

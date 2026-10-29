@@ -20,7 +20,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ token: 
   const body: any = await req.json().catch(() => ({}));
   const number = String(body.number ?? '').replace(/\s/g, '');
   const card = CARDS[number] ?? CARDS['4242424242424242']!;
-  const setup = await startSetup(rt.deps, token, { ip: clientIp(req) });
+  const setup = await startSetup(rt.deps, token, { ip: clientIp(req, rt.deps.config.trustedProxyHops) });
   if (setup.status !== 'ok') return jsonResponse({ status: setup.status }, 409);
   const pm = `pm_fake_${number || 'default'}_${setup.setupIntentId}`;
   rt.e2e.stripe.setCardBehavior(pm, card.behavior, card.code);

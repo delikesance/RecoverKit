@@ -84,7 +84,9 @@ export async function runWeeklyDigests(deps: Deps): Promise<{ sent: number; skip
         where tenant_id = $1 and state in ('OPEN','RECOVERING','PAUSED') group by currency`,
       [t.id],
     );
-    if (byCurrency.size === 0 && risk.rows.length === 0 && entries.length === 0) {
+    const currencies = [...new Set([...byCurrency.keys(), ...risk.rows.map((r) => r.currency)])].sort();
+    // Rien à dire (ex. uniquement du NATURAL, aucun dossier à risque) : pas d'email vide.
+    if (currencies.length === 0) {
       skipped++;
       continue;
     }
@@ -97,14 +99,18 @@ export async function runWeeklyDigests(deps: Deps): Promise<{ sent: number; skip
 
     const L = STR[t.locale === 'en' ? 'en' : 'fr'];
     const locale = t.locale === 'en' ? 'en-US' : 'fr-FR';
-    const currencies = [...new Set([...byCurrency.keys(), ...risk.rows.map((r) => r.currency)])].sort();
     const lines: string[] = [];
+    // Titre : la devise qui a le plus récupéré ; à défaut, la première devise à risque.
+    const top = currencies
+      .filter((c) => (byCurrency.get(c)?.recovered ?? 0) > 0)
+      .sort((a, b) => byCurrency.get(b)!.recovered - byCurrency.get(a)!.recovered)[0];
+    const headCurrency = top ?? currencies[0]!;
     let headline = '';
     for (const c of currencies) {
       const rec = byCurrency.get(c);
       const rk = risk.rows.find((r) => r.currency === c);
       const amount = Money.of(rec?.recovered ?? 0, c).format(locale);
-      if (!headline) headline = amount;
+      if (c === headCurrency) headline = amount;
       lines.push(L.recovered(amount));
       if (rec && rec.cases.size > 0) lines.push(L.saved(rec.cases.size));
       if (rk) lines.push(L.atRisk(Money.of(Number(rk.amount), c).format(locale), rk.n));

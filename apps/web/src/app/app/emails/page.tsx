@@ -2,21 +2,25 @@ import type { Metadata } from 'next';
 import { TEMPLATE_VARIABLES } from '@recoverkit/core';
 import { getTemplates, previewTemplate } from '@recoverkit/services';
 import { loadAppContext } from '@/server/context';
+import { readFlash } from '@/server/flash';
 import { AppShell } from '@/ui/AppShell';
 import { Banners } from '@/ui/Banners';
 import { Chip } from '@/ui/Chip';
 import { Flash } from '@/ui/Flash';
+import { FlashClear } from '@/ui/FlashClear';
+import { templateDraft } from '@/lib/drafts';
 import { resetTemplateAction, saveTemplateAction, sendTestEmailAction } from '../actions';
 
 export const metadata: Metadata = { title: 'Emails' };
 export const dynamic = 'force-dynamic';
 
-export default async function EmailsPage({ searchParams }: { searchParams: Promise<{ locale?: string; notice?: string; error?: string; step?: string }> }) {
+export default async function EmailsPage({ searchParams }: { searchParams: Promise<{ locale?: string; notice?: string; step?: string }> }) {
   const sp = await searchParams;
+  const flash = await readFlash('/app/emails');
   const ctx = await loadAppContext();
   const locale = sp.locale === 'en' ? 'en' : 'fr';
   const templates = await getTemplates(ctx.deps, ctx.tenant.id, locale);
-  const open = Number(sp.step ?? 0);
+  const open = flash?.draft ? flash.draft.step : sp.step !== undefined && Number.isInteger(Number(sp.step)) ? Number(sp.step) : 0;
 
   return (
     <AppShell tenantName={ctx.tenant.name} active="emails" activeCases={ctx.activeCases} stripe={ctx.stripe} userEmail={ctx.session.email}>
@@ -31,11 +35,13 @@ export default async function EmailsPage({ searchParams }: { searchParams: Promi
         </nav>
       </div>
       <Banners alerts={ctx.alerts} />
-      <Flash notice={sp.notice} error={sp.error} />
+      <Flash notice={sp.notice} error={flash?.draft ? undefined : flash?.error} />
+      {flash ? <FlashClear /> : null}
       <p className="muted" style={{ fontSize: 14 }}>Variables disponibles : {TEMPLATE_VARIABLES.map((v) => `{{${v}}}`).join(', ')}. Le lien {'{{update_link}}'} est obligatoire.</p>
 
       <div className="stack" style={{ gap: 16 }}>
         {templates.map((t) => {
+          const draft = templateDraft(flash, t);
           const preview = previewTemplate({ subject: t.subject, body: t.body }, locale, ctx.tenant.name);
           return (
             <details key={t.stepIndex} className="panel" open={t.stepIndex === open} style={{ padding: 0 }}>
@@ -48,8 +54,9 @@ export default async function EmailsPage({ searchParams }: { searchParams: Promi
                 <form action={saveTemplateAction} className="col-main stack" style={{ gap: 16 }}>
                   <input type="hidden" name="stepIndex" value={t.stepIndex} />
                   <input type="hidden" name="locale" value={locale} />
-                  <div><label className="label" htmlFor={`subject-${t.stepIndex}`}>Objet</label><input id={`subject-${t.stepIndex}`} name="subject" className="field" defaultValue={t.subject} required /></div>
-                  <div><label className="label" htmlFor={`body-${t.stepIndex}`}>Message</label><textarea id={`body-${t.stepIndex}`} name="body" className="field" rows={10} defaultValue={t.body} required /></div>
+                  {flash?.error && flash.draft?.step === t.stepIndex ? <div className="banner banner-critical" role="alert"><span className="grow">{flash.error}</span></div> : null}
+                  <div><label className="label" htmlFor={`subject-${t.stepIndex}`}>Objet</label><input id={`subject-${t.stepIndex}`} name="subject" className="field" defaultValue={draft.subject} required /></div>
+                  <div><label className="label" htmlFor={`body-${t.stepIndex}`}>Message</label><textarea id={`body-${t.stepIndex}`} name="body" className="field" rows={10} defaultValue={draft.body} required /></div>
                   <div className="row wrap" style={{ gap: 12 }}>
                     <button type="submit" className="btn btn-p">Enregistrer</button>
                   </div>

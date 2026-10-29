@@ -1,11 +1,12 @@
+import { logAction } from '@recoverkit/db';
 import type { Deps } from '../deps';
 
 /** Export complet des données d'un tenant (sans secrets : ni hash de token, ni sessions). */
-export async function exportTenantData(deps: Deps, tenantId: string) {
+export async function exportTenantData(deps: Deps, tenantId: string, o: { actor?: string } = {}) {
   const q = async (sql: string) => (await deps.pool.query(sql, [tenantId])).rows;
   const tenant = (await q(`select id, name, time_zone, locale, support_email, sender_name, sender_email, reply_to, send_start_hour, send_end_hour, emails_enabled, dry_run, digest_enabled, created_at from tenants where id = $1`))[0];
   if (!tenant) throw new Error('Tenant introuvable');
-  return {
+  const data = {
     exportedAt: deps.clock.now().toISOString(),
     tenant,
     customers: await q(`select stripe_customer_id, email, name, locale, created_at from end_customers where tenant_id = $1 order by created_at`),
@@ -18,5 +19,11 @@ export async function exportTenantData(deps: Deps, tenantId: string) {
     sequences: await q(`select version, steps, created_at from sequences where tenant_id = $1 order by version`),
     templates: await q(`select step_index, locale, subject, body from email_templates where tenant_id = $1`),
     suppressions: await q(`select email, reason, created_at from suppressions where tenant_id = $1`),
+    users: await q(`select email, created_at from users where tenant_id = $1`),
+    stripeConnections: await q(`select stripe_account_id, status, created_at from stripe_connections where tenant_id = $1`),
+    billing: await q(`select * from billing_subscriptions where tenant_id = $1`),
+    digests: await q(`select * from digests where tenant_id = $1`),
   };
+  await logAction(deps.pool, { tenantId, caseId: null, actor: o.actor ?? 'user', action: 'tenant.exported', details: { at: data.exportedAt } });
+  return data;
 }

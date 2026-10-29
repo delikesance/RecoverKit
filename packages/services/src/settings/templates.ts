@@ -11,6 +11,72 @@ export interface TemplateView extends EmailTemplate {
   isCustom: boolean;
 }
 
+const MIDDLE: Record<Locale, EmailTemplate[]> = {
+  fr: [
+    {
+      subject: 'Votre abonnement {{plan}} est toujours en attente de paiement',
+      body: `Bonjour {{customer_name}},
+
+Le paiement de {{amount}} pour votre abonnement {{plan}} chez {{tenant_name}} n’a toujours pas pu être effectué.
+
+Mettez votre carte à jour pour éviter toute interruption :
+
+{{update_link}}
+
+Besoin d’aide ? Répondez simplement à cet email.`,
+    },
+    {
+      subject: 'Nouveau rappel : votre paiement de {{amount}} est en attente',
+      body: `Bonjour {{customer_name}},
+
+Nous vous relançons car votre paiement de {{amount}} pour l’abonnement {{plan}} n’est pas encore réglé.
+
+Quelques instants suffisent pour mettre votre carte à jour :
+
+{{update_link}}
+
+Si c’est déjà fait, ignorez ce message.`,
+    },
+  ],
+  en: [
+    {
+      subject: 'Your {{plan}} subscription is still awaiting payment',
+      body: `Hi {{customer_name}},
+
+Your {{amount}} payment for the {{plan}} subscription to {{tenant_name}} still hasn’t gone through.
+
+Update your card to avoid any interruption:
+
+{{update_link}}
+
+Need help? Just reply to this email.`,
+    },
+    {
+      subject: 'Another reminder: your {{amount}} payment is pending',
+      body: `Hi {{customer_name}},
+
+We’re following up because your {{amount}} payment for the {{plan}} subscription hasn’t been settled yet.
+
+It only takes a moment to update your card:
+
+{{update_link}}
+
+If you already did, please ignore this message.`,
+    },
+  ],
+};
+
+/**
+ * Modèle par défaut d'une étape : « dernier avis » seulement pour la dernière étape d'une séquence
+ * de plus de 4 étapes ; les étapes intermédiaires au-delà de la 3e ont leur propre texte.
+ */
+export function defaultTemplateFor(stepIndex: number, locale: Locale, totalSteps: number): EmailTemplate {
+  if (totalSteps <= 4 || stepIndex <= 2) return defaultTemplate(stepIndex, locale);
+  if (stepIndex >= totalSteps - 1) return defaultTemplate(3, locale);
+  const middle = MIDDLE[locale];
+  return { ...middle[(stepIndex - 3) % middle.length]! };
+}
+
 export async function getTemplates(deps: Deps, tenantId: string, locale: Locale): Promise<TemplateView[]> {
   const seq = await getSequence(deps, tenantId);
   const count = Math.max(seq?.steps.length ?? 0, 4);
@@ -18,7 +84,7 @@ export async function getTemplates(deps: Deps, tenantId: string, locale: Locale)
   const byStep = new Map<number, EmailTemplate>(custom.rows.map((r) => [r.step_index, { subject: r.subject, body: r.body }]));
   return Array.from({ length: count }, (_, i) => {
     const c = byStep.get(i);
-    return { stepIndex: i, isCustom: !!c, ...(c ?? defaultTemplate(i, locale)) };
+    return { stepIndex: i, isCustom: !!c, ...(c ?? defaultTemplateFor(i, locale, count)) };
   });
 }
 

@@ -1,4 +1,4 @@
-import { caseBadge, formatMoney, relativeFromNow, failureLabel } from '@/lib/format';
+import { caseBadge, formatMoney, relativeFromNow, failureLabel, type Attribution } from '@/lib/format';
 import type { CaseListRow } from '@recoverkit/services';
 import { Chip } from './Chip';
 import { Segments } from './Segments';
@@ -8,8 +8,16 @@ function initials(name: string | null): string {
   return name.split(/\s+/).map((p) => p[0]).slice(0, 2).join('').toUpperCase();
 }
 
-export function CasesTable({ rows, now, timeZone }: { rows: CaseListRow[]; now: Date; timeZone: string }) {
+export function CasesTable({ rows, now, timeZone, attributions = {}, filtered = false }: { rows: CaseListRow[]; now: Date; timeZone: string; attributions?: Record<string, Attribution>; filtered?: boolean }) {
   void timeZone;
+  if (rows.length === 0 && filtered) {
+    return (
+      <div style={{ padding: '40px 8px', textAlign: 'center' }}>
+        <p style={{ fontWeight: 600 }}>Aucun dossier ne correspond à ces filtres.</p>
+        <p style={{ marginTop: 8 }}><a href="/app/cases" className="btn btn-s">Réinitialiser les filtres</a></p>
+      </div>
+    );
+  }
   if (rows.length === 0) {
     return (
       <div style={{ padding: '40px 8px', textAlign: 'center' }}>
@@ -32,7 +40,7 @@ export function CasesTable({ rows, now, timeZone }: { rows: CaseListRow[]; now: 
         </thead>
         <tbody>
           {rows.map((r) => {
-            const badge = caseBadge(r, now);
+            const badge = caseBadge({ ...r, attribution: attributions[r.id] ?? null }, now);
             return (
               <tr key={r.id}>
                 <td>

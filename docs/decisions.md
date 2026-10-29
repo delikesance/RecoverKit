@@ -34,3 +34,8 @@ Source : plan d'implémentation. Toute nouvelle ambiguïté est tranchée ici, j
 - **APP_URL en production** : HTTPS exigé, sauf `localhost` (démarrage local et E2E avec `next start`).
 - **Pages légales** : modèles à compléter par l'exploitant (raison sociale, adresse, hébergeur) avant la mise en production ; aucune donnée d'entreprise n'est inventée.
 - **Prix** : aucun prix n'est codé en dur ; sans `PLANS`, le site affiche l'essai gratuit seul et la facturation n'est pas appliquée.
+
+## Compromis acceptés
+
+- **Envoi d'email et appels Stripe sous le verrou consultatif du tenant** : `mailer.send` et les appels Stripe sont exécutés alors que le verrou du tenant est tenu. Justification : le verrou garde contre une clôture ou une pause du tenant pendant l'envoi (aucune relance partie après clôture). Les clés d'idempotence protègent des doublons en cas de rejeu. Le blocage est borné par les délais d'attente : Resend 15 s, Stripe 20 s.
+- **`payment_attempts` non committé avant l'appel Stripe** : la ligne est écrite dans la transaction en cours, pas avant l'appel. Justification : la clé d'idempotence `retry:<dossier>:<moyen>` garantit un seul débit au rejeu ; si la transaction est annulée, le rejeu avec la même clé renvoie le même résultat Stripe, donc le rollback ne perd aucun débit (le revenu reste auditable).

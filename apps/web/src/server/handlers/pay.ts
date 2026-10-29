@@ -4,7 +4,7 @@ import { FORBIDDEN, clientIp, csrfOk, jsonResponse } from '../http';
 /** Crée le SetupIntent pour le lien de paiement. Le secret n'est jamais mis en cache. */
 export async function handlePaySetup(deps: Deps, req: Request, token: string): Promise<Response> {
   if (!csrfOk(deps, req)) return FORBIDDEN();
-  const r = await startSetup(deps, token, { ip: clientIp(req) });
+  const r = await startSetup(deps, token, { ip: clientIp(req, deps.config.trustedProxyHops) });
   switch (r.status) {
     case 'ok':
       return jsonResponse({ clientSecret: r.clientSecret, setupIntentId: r.setupIntentId, account: r.account, publishableKey: r.publishableKey });

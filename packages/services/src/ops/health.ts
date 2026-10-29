@@ -29,11 +29,12 @@ export async function getHealthDetails(deps: Deps): Promise<HealthDetails> {
     const inbox = await q(`select count(*) filter (where status = 'pending')::int as pending, count(*) filter (where status = 'dead')::int as dead, min(received_at) filter (where status = 'pending') as oldest from inbox_events`);
     const steps = await q(
       `select count(*) filter (where s.status = 'SCHEDULED' and s.due_at < $1 and c.state = 'RECOVERING')::int as overdue,
-              count(*) filter (where s.status = 'SENDING')::int as sending,
-              count(*) filter (where s.status = 'FAILED' and s.created_at > $2)::int as failed
+              count(*) filter (where s.status = 'SENDING')::int as sending
          from scheduled_steps s join recovery_cases c on c.id = s.case_id`,
-      [new Date(now.getTime() - OVERDUE_MS), since],
+      [new Date(now.getTime() - OVERDUE_MS)],
     );
+    // scheduled_steps n'a pas de date d'échec : le journal d'actions (append-only) fait foi.
+    const failed = await q(`select count(*)::int as n from action_log where action = 'email.failed' and created_at > $1`, [since]);
     const emails = await q(`select count(*)::int as sent from email_messages where dry_run = false and sent_at > $1`, [since]);
     const alerts = await q(`select count(*)::int as n from system_alerts where resolved_at is null`);
 
@@ -43,8 +44,8 @@ export async function getHealthDetails(deps: Deps): Promise<HealthDetails> {
       status: degraded ? 'degraded' : 'ok',
       db: 'ok',
       inbox: { pending: inbox.pending, dead: inbox.dead, oldestPendingAgeSeconds: age },
-      steps: { overdue: steps.overdue, sending: steps.sending, failed24h: steps.failed },
-      emails: { sent24h: emails.sent, failed24h: steps.failed },
+      steps: { overdue: steps.overdue, sending: steps.sending, failed24h: failed.n },
+      emails: { sent24h: emails.sent, failed24h: failed.n },
       alerts: { open: alerts.n },
     };
   } catch (e) {

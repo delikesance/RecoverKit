@@ -1,4 +1,4 @@
-import { actionLabel, formatDateTime } from '@/lib/format';
+import { actionLabel, formatDateTime, type Attribution } from '@/lib/format';
 
 export interface TimelineEvent {
   action: string;
@@ -11,10 +11,12 @@ export function Timeline({
   events,
   timeZone,
   upcoming = [],
+  attribution = null,
 }: {
   events: TimelineEvent[];
   timeZone: string;
   upcoming?: { label: string; at: Date }[];
+  attribution?: Attribution;
 }) {
   const past = [...events].sort((a, b) => b.at.getTime() - a.at.getTime());
   return (
@@ -28,7 +30,7 @@ export function Timeline({
       {past.map((e, i) => (
         <li key={`${e.action}-${e.at.toISOString()}-${i}`}>
           <div className="rail"><i style={e.action.startsWith('retry.failed') || e.action === 'case.lost' ? { background: 'var(--red)' } : undefined} /><s /></div>
-          <div className="body"><b>{actionLabel(e.action, e.details)}</b><span className="muted" style={{ display: 'block', fontSize: 14 }}>{formatDateTime(e.at, timeZone)}</span></div>
+          <div className="body"><b>{actionLabel(e.action, e.details, attribution)}</b><span className="muted" style={{ display: 'block', fontSize: 14 }}>{formatDateTime(e.at, timeZone)}</span></div>
         </li>
       ))}
     </ol>

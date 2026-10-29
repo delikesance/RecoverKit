@@ -1,9 +1,15 @@
 **/node_modules
 **/.next
 **/dist
+**/*.tsbuildinfo
 coverage
 .git
 **/test-results
 apps/web/e2e
 docs
 .github
+.env
+.env.*
+**/.env
+**/.env.*
+docker-compose.yml

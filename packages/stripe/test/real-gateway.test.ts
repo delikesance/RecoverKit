@@ -36,7 +36,9 @@ const params = (body: string) => Object.fromEntries(new URLSearchParams(body));
 
 describe('StripeSdkGateway', () => {
   it('retrieveInvoice : en-tête Stripe-Account et mapping (API récente, abonnement dans parent)', async () => {
-    const { gateway, seen } = await start(() => ({
+    const { gateway, seen } = await start((req) => req.url!.includes('/v1/prices/')
+      ? { status: 200, json: { id: 'price_1', object: 'price', nickname: null, product: { id: 'prod_1', object: 'product', name: 'Pro' } } }
+      : {
       status: 200,
       json: {
         id: 'in_1', object: 'invoice', customer: 'cus_1', status: 'open', amount_due: 2900, amount_paid: 0,
@@ -45,14 +47,14 @@ describe('StripeSdkGateway', () => {
         lines: { data: [{ description: 'Pro', pricing: { price_details: { price: 'price_1' } } }] },
         status_transitions: { paid_at: null },
       },
-    }));
+    });
     const inv = await gateway.retrieveInvoice('acct_1', 'in_1');
     expect(seen[0]!.url).toContain('/v1/invoices/in_1');
     expect(seen[0]!.headers['stripe-account']).toBe('acct_1');
     expect(seen[0]!.headers.authorization).toBe('Bearer sk_test_123');
     expect(inv).toMatchObject({
       id: 'in_1', customerId: 'cus_1', subscriptionId: 'sub_1', status: 'open', amountDue: 2900,
-      amountPaid: 0, currency: 'EUR', attemptCount: 2, paidAt: null,
+      amountPaid: 0, currency: 'EUR', attemptCount: 2, paidAt: null, planName: 'Pro',
       hostedInvoiceUrl: 'https://invoice.stripe.com/i/acct_1/test_123',
     });
   });
@@ -80,6 +82,131 @@ describe('StripeSdkGateway', () => {
     expect(params(seen[0]!.body)).toMatchObject({ payment_method: 'pm_1', off_session: 'true' });
     expect(seen[0]!.headers['idempotency-key']).toBe('key-1');
     expect(seen[0]!.headers['stripe-account']).toBe('acct_1');
+  });
+
+  it('payInvoice : 200 mais facture encore open (SEPA asynchrone) = processing, jamais paid', async () => {
+    const { gateway } = await start(() => ({
+      status: 200,
+      json: { id: 'in_1', object: 'invoice', status: 'open', amount_due: 2900, amount_paid: 0 },
+    }));
+    expect(await gateway.payInvoice('acct_1', 'in_1', { paymentMethodId: 'pm_sepa', idempotencyKey: 'k' })).toEqual({
+      status: 'processing',
+    });
+  });
+
+  it.each(['invoice_payment_intent_requires_action', 'payment_intent_action_required', 'authentication_required'])(
+    'payInvoice : code %s (invalid_request_error, 400) = requires_action',
+    async (code) => {
+      const { gateway } = await start(() => ({
+        status: 400,
+        json: { error: { type: 'invalid_request_error', code, message: 'action requise' } },
+      }));
+      expect(await gateway.payInvoice('acct_1', 'in_1', { paymentMethodId: 'pm_1', idempotencyKey: 'k' })).toEqual({
+        status: 'requires_action',
+      });
+    },
+  );
+
+  it('retrieveInvoice : code d’échec, moyen de paiement et date lus sur le PaymentIntent de la facture', async () => {
+    const { gateway, seen } = await start((req) =>
+      req.url!.includes('/v1/prices/')
+        ? { status: 200, json: { id: 'price_1', object: 'price', nickname: 'Pro', product: 'prod_1' } }
+        : {
+            status: 200,
+            json: {
+              id: 'in_3', object: 'invoice', customer: 'cus_1', status: 'open', amount_due: 2900, amount_paid: 0,
+              currency: 'eur', attempt_count: 1, last_finalization_error: null,
+              lines: { data: [] },
+              payments: {
+                object: 'list', has_more: false,
+                data: [{
+                  id: 'inpay_1', object: 'invoice_payment', status: 'open', created: 1790000500,
+                  payment: {
+                    type: 'payment_intent',
+                    payment_intent: {
+                      id: 'pi_1', object: 'payment_intent', status: 'requires_payment_method',
+                      last_payment_error: {
+                        code: 'card_declined', decline_code: 'insufficient_funds', type: 'card_error',
+                        payment_method: { id: 'pm_failed', object: 'payment_method' },
+                      },
+                    },
+                  },
+                }],
+              },
+            },
+          },
+    );
+    const inv = await gateway.retrieveInvoice('acct_1', 'in_3');
+    expect(decodeURIComponent(seen[0]!.url!)).toContain('payments.data.payment.payment_intent');
+    expect(inv.lastErrorCode).toBe('insufficient_funds');
+    expect(inv.failedPaymentMethodId).toBe('pm_failed');
+    expect(inv.failedAt?.getTime()).toBe(1790000500 * 1000);
+  });
+
+  it('retrieveInvoice : sans échec de paiement, pas de code (et last_finalization_error est ignoré)', async () => {
+    const { gateway } = await start(() => ({
+      status: 200,
+      json: {
+        id: 'in_4', object: 'invoice', customer: 'cus_1', status: 'open', amount_due: 2900, amount_paid: 0,
+        currency: 'eur', attempt_count: 0, last_finalization_error: { code: 'invoice_no_customer_line_items' },
+        lines: { data: [] }, payments: { object: 'list', data: [], has_more: false },
+      },
+    }));
+    const inv = await gateway.retrieveInvoice('acct_1', 'in_4');
+    expect(inv.lastErrorCode ?? null).toBeNull();
+    expect(inv.failedPaymentMethodId ?? null).toBeNull();
+  });
+
+  it('planName : nickname du prix ou nom du produit, jamais la description de ligne', async () => {
+    const { gateway } = await start((req) =>
+      req.url!.includes('/v1/prices/')
+        ? { status: 200, json: { id: 'price_1', object: 'price', nickname: null, product: { id: 'prod_1', object: 'product', name: 'Pro' } } }
+        : {
+            status: 200,
+            json: {
+              id: 'in_5', object: 'invoice', customer: 'cus_1', status: 'open', amount_due: 2900, amount_paid: 0,
+              currency: 'eur', attempt_count: 1,
+              lines: { data: [{ description: '1 × Pro (at €29.00 / month)', pricing: { price_details: { price: 'price_1', product: 'prod_1' } } }] },
+            },
+          },
+    );
+    expect((await gateway.retrieveInvoice('acct_1', 'in_5')).planName).toBe('Pro');
+  });
+
+  it('planName : null si le prix est introuvable (pas la description de ligne)', async () => {
+    const { gateway } = await start((req) =>
+      req.url!.includes('/v1/prices/')
+        ? { status: 404, json: { error: { type: 'invalid_request_error', code: 'resource_missing', message: 'x' } } }
+        : {
+            status: 200,
+            json: {
+              id: 'in_6', object: 'invoice', customer: 'cus_1', status: 'open', amount_due: 2900, amount_paid: 0,
+              currency: 'eur', attempt_count: 1,
+              lines: { data: [{ description: '1 × Pro (at €29.00 / month)', pricing: { price_details: { price: 'price_1' } } }] },
+            },
+          },
+    );
+    expect((await gateway.retrieveInvoice('acct_1', 'in_6')).planName ?? null).toBeNull();
+  });
+
+  it('retrieveSubscription : somme tous les items, unit_amount null ne compte pas comme un prix à 0', async () => {
+    const { gateway } = await start(() => ({
+      status: 200,
+      json: {
+        id: 'sub_1', object: 'subscription', customer: 'cus_1', status: 'active',
+        items: {
+          data: [
+            { quantity: 2, price: { unit_amount: 1000, currency: 'eur', nickname: 'Pro', recurring: { interval: 'month', interval_count: 1 } } },
+            { quantity: 1, price: { unit_amount: 500, currency: 'eur', recurring: { interval: 'month', interval_count: 1 } } },
+            { quantity: 3, price: { unit_amount: null, currency: 'eur', billing_scheme: 'tiered', recurring: { interval: 'month', interval_count: 1 } } },
+          ],
+        },
+      },
+    }));
+    const s = await gateway.retrieveSubscription('acct_1', 'sub_1');
+    expect(s.amount).toBe(2500);
+    expect(s.planName).toBe('Pro');
+    expect(s.unpricedItems).toBe(1);
   });
 
   it('payInvoice : carte refusée = failed avec le motif, pas d’exception', async () => {
@@ -222,5 +349,110 @@ describe('StripeSdkGateway', () => {
     expect(list.map((i) => i.id)).toEqual(['in_1', 'in_2', 'in_3']);
     expect(seen[0]!.url).toContain('status=open');
     expect(seen[0]!.headers['stripe-account']).toBe('acct_1');
+  });
+
+  it('listOpenInvoices : pas d’expansion (limite de profondeur Stripe), la réconciliation relit chaque facture', async () => {
+    const { gateway, seen } = await start(() => ({
+      status: 200,
+      json: {
+        object: 'list', has_more: false,
+        data: [{
+          id: 'in_1', object: 'invoice', customer: 'cus_1', subscription: 'sub_1', status: 'open', amount_due: 2900, amount_paid: 0,
+          currency: 'eur', attempt_count: 1, lines: { data: [] },
+        }],
+      },
+    }));
+    const [inv] = await gateway.listOpenInvoices('acct_1');
+    expect(decodeURIComponent(seen[0]!.url!)).not.toContain('expand');
+    expect(inv!.id).toBe('in_1');
+    expect(inv!.lastErrorCode).toBeNull();
+  });
+
+  it('abonnements : le produit est expand sur retrieve (pas sur list) et fournit planName sans nickname', async () => {
+    const sub = {
+      id: 'sub_1', object: 'subscription', customer: 'cus_1', status: 'active',
+      items: { data: [{ quantity: 1, price: { unit_amount: 2900, currency: 'eur', nickname: null, product: { id: 'prod_1', object: 'product', name: 'Pro' }, recurring: { interval: 'month', interval_count: 1 } } }] },
+    };
+    const { gateway, seen } = await start((req) =>
+      req.url!.startsWith('/v1/subscriptions/sub_1')
+        ? { status: 200, json: sub }
+        : { status: 200, json: { object: 'list', has_more: false, data: [sub] } },
+    );
+    expect((await gateway.retrieveSubscription('acct_1', 'sub_1')).planName).toBe('Pro');
+    expect(decodeURIComponent(seen[0]!.url!)).toContain('expand[0]=items.data.price.product');
+    expect((await gateway.listSubscriptions('acct_1', { statuses: ['active'] }))[0]!.planName).toBe('Pro');
+    expect(decodeURIComponent(seen[1]!.url!)).not.toContain('expand'); // la liste ne sert qu'au MRR : pas d'expansion (limite de profondeur Stripe)
+  });
+
+  it('retrieveSubscription : item mesuré (metered) exclu du montant et compté dans unpricedItems', async () => {
+    const rec = { interval: 'month', interval_count: 1 };
+    const { gateway } = await start(() => ({
+      status: 200,
+      json: {
+        id: 'sub_1', object: 'subscription', customer: 'cus_1', status: 'active',
+        items: { data: [
+          { quantity: 1, price: { unit_amount: 2900, currency: 'eur', recurring: { ...rec, usage_type: 'licensed' } } },
+          { quantity: 1, price: { unit_amount: 5, currency: 'eur', recurring: { ...rec, usage_type: 'metered' } } },
+        ] },
+      },
+    }));
+    const s = await gateway.retrieveSubscription('acct_1', 'sub_1');
+    expect(s.amount).toBe(2900);
+    expect(s.unpricedItems).toBe(1);
+  });
+
+  it('planName : une erreur 401 n’est pas avalée (remonte en GatewayError)', async () => {
+    const { gateway } = await start((req) =>
+      req.url!.includes('/v1/prices/')
+        ? { status: 401, json: { error: { type: 'invalid_request_error', message: 'bad key' } } }
+        : { status: 200, json: { id: 'in_7', object: 'invoice', customer: 'cus_1', status: 'open', amount_due: 1, amount_paid: 0, currency: 'eur', attempt_count: 1,
+            lines: { data: [{ pricing: { price_details: { price: 'price_1' } } }] } } },
+    );
+    await expect(gateway.retrieveInvoice('acct_1', 'in_7')).rejects.toMatchObject({ name: 'GatewayError', kind: 'invalid_request' });
+  });
+
+  it('listOpenInvoices : un prix partagé n’est récupéré qu’une fois (pas de N+1)', async () => {
+    const inv = (id: string, price: string) => ({ id, object: 'invoice', customer: 'cus_1', status: 'open', amount_due: 1, amount_paid: 0, currency: 'eur', attempt_count: 1,
+      lines: { data: [{ pricing: { price_details: { price } } }] } });
+    const { gateway, seen } = await start((req) =>
+      req.url!.includes('/v1/prices/')
+        ? { status: 200, json: { id: 'p', object: 'price', nickname: 'Plan', product: 'prod_1' } }
+        : { status: 200, json: { object: 'list', has_more: false, data: [inv('in_1', 'price_a'), inv('in_2', 'price_a'), inv('in_3', 'price_b')] } },
+    );
+    const list = await gateway.listOpenInvoices('acct_1');
+    expect(list.map((i) => i.planName)).toEqual(['Plan', 'Plan', 'Plan']);
+    expect(seen.filter((r) => r.url!.includes('/v1/prices/')).map((r) => r.url!.split('?')[0]).sort()).toEqual(['/v1/prices/price_a', '/v1/prices/price_b']);
+  });
+
+  it.each(['authentication_required', 'invoice_payment_intent_requires_action'])(
+    'payInvoice : carte refusée avec decline_code %s = requires_action',
+    async (decline) => {
+      const { gateway } = await start(() => ({
+        status: 402,
+        json: { error: { type: 'card_error', code: 'card_declined', decline_code: decline, message: 'x' } },
+      }));
+      expect(await gateway.payInvoice('acct_1', 'in_1', { paymentMethodId: 'pm_1', idempotencyKey: 'k' })).toEqual({ status: 'requires_action' });
+    },
+  );
+
+  it('payInvoice : payment_intent_authentication_failure = requires_action', async () => {
+    const { gateway } = await start(() => ({
+      status: 402,
+      json: { error: { type: 'card_error', code: 'payment_intent_authentication_failure', message: 'x' } },
+    }));
+    expect(await gateway.payInvoice('acct_1', 'in_1', { paymentMethodId: 'pm_1', idempotencyKey: 'k' })).toEqual({ status: 'requires_action' });
+  });
+
+  it('timeout : le client Stripe et OAuth abandonnent un serveur muet (erreur réessayable)', async () => {
+    server = createServer(() => { /* ne répond jamais */ });
+    await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r));
+    const port = (server.address() as { port: number }).port;
+    const gateway = new StripeSdkGateway({
+      secretKey: 'sk_test_123', host: '127.0.0.1', port, protocol: 'http', maxNetworkRetries: 0,
+      connectBaseUrl: `http://127.0.0.1:${port}`, timeoutMs: 200, oauthTimeoutMs: 200,
+    });
+    await expect(gateway.retrieveInvoice('acct_1', 'in_1')).rejects.toMatchObject({ name: 'GatewayError', retryable: true });
+    await expect(gateway.deauthorize('acct_1')).rejects.toMatchObject({ name: 'GatewayError', retryable: true });
+    server.closeAllConnections();
   });
 });

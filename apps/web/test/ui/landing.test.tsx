@@ -92,6 +92,12 @@ describe('LandingView', () => {
     for (const d of items) expect(d.querySelector('summary')).not.toBeNull();
   });
 
+  it('aucune pastille « Le plus choisi » inventée, quel que soit le nombre de paliers', () => {
+    const { container } = render(<LandingView plans={plans} trialDays={14} />);
+    expect(container.textContent).not.toMatch(/Le plus choisi/i);
+    expect(container.textContent).not.toMatch(/se rembourse tout seul/i);
+  });
+
   it('pied de page avec les pages légales', () => {
     render(<LandingView plans={plans} trialDays={14} />);
     expect(screen.getByRole('link', { name: 'Mentions légales' }).getAttribute('href')).toBe('/mentions-legales');

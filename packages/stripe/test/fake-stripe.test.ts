@@ -71,13 +71,37 @@ describe('FakeStripe', () => {
     expect(s.chargeCount('in_1')).toBe(1);
   });
 
-  it('payer une facture déjà payée renvoie paid sans nouvel encaissement', async () => {
+  it('payer une facture déjà payée = GatewayError invalid_request non réessayable (comme Stripe), sans nouvel encaissement', async () => {
     const s = setup();
     s.setCardBehavior('pm_new', 'succeed');
     await s.payInvoice(ACCT, 'in_1', { paymentMethodId: 'pm_new', idempotencyKey: 'a' });
-    const again = await s.payInvoice(ACCT, 'in_1', { paymentMethodId: 'pm_new', idempotencyKey: 'b' });
-    expect(again).toEqual({ status: 'paid' });
+    const again = s.payInvoice(ACCT, 'in_1', { paymentMethodId: 'pm_new', idempotencyKey: 'b' });
+    await expect(again).rejects.toMatchObject({ kind: 'invalid_request', retryable: false });
     expect(s.chargeCount('in_1')).toBe(1);
+  });
+
+  it("rejouer la même clé d'idempotence sur une facture payée renvoie le résultat d'origine", async () => {
+    const s = setup();
+    await s.payInvoice(ACCT, 'in_1', { paymentMethodId: 'pm_new', idempotencyKey: 'a' });
+    expect(await s.payInvoice(ACCT, 'in_1', { paymentMethodId: 'pm_new', idempotencyKey: 'a' })).toEqual({ status: 'paid' });
+  });
+
+  it("enregistre les clés d'idempotence reçues par payInvoice", async () => {
+    const s = setup();
+    s.setCardBehavior('pm_bad', 'decline', 'card_declined');
+    await s.payInvoice(ACCT, 'in_1', { paymentMethodId: 'pm_bad', idempotencyKey: 'retry:case1:pm_bad' });
+    await s.payInvoice(ACCT, 'in_1', { paymentMethodId: 'pm_new', idempotencyKey: 'retry:case1:pm_new' });
+    expect(s.idempotencyKeys).toEqual(['retry:case1:pm_bad', 'retry:case1:pm_new']);
+  });
+
+  it('paiement asynchrone (SEPA) : processing, facture toujours ouverte, pas encore encaissée', async () => {
+    const s = setup();
+    s.setCardBehavior('pm_sepa', 'processing');
+    expect(await s.payInvoice(ACCT, 'in_1', { paymentMethodId: 'pm_sepa', idempotencyKey: 'k' })).toEqual({
+      status: 'processing',
+    });
+    expect((await s.retrieveInvoice(ACCT, 'in_1')).status).toBe('open');
+    expect(s.chargeCount('in_1')).toBe(0);
   });
 
   it('SetupIntent : création puis confirmation par le client', async () => {

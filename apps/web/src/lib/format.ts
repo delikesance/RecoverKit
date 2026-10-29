@@ -61,8 +61,46 @@ const STATES: Record<string, { label: string; tone: Tone }> = {
   CLOSED_MANUAL: { label: 'Clôturé', tone: 'neutral' },
 };
 
-export function stateLabel(state: string): { label: string; tone: Tone } {
+export type Attribution = 'ASSISTED' | 'NATURAL' | null;
+
+/** « Récupéré » seulement si le ledger l'attribue à une relance : un paiement arrivé avant tout email n'est pas compté. */
+export function stateLabel(state: string, attribution?: Attribution): { label: string; tone: Tone } {
+  if (state === 'RECOVERED') {
+    if (attribution === 'ASSISTED') return STATES.RECOVERED!;
+    if (attribution === 'NATURAL') return { label: 'Payé sans relance (non compté)', tone: 'neutral' };
+    return { label: 'Payé (non compté)', tone: 'neutral' };
+  }
   return STATES[state] ?? { label: state, tone: 'neutral' };
+}
+
+/** Pastille « Facture » du détail : reflète l'état réel du dossier (une facture clôturée ou perdue n'est pas « impayée à relancer »). */
+export function invoiceChip(state: string): { label: string; tone: Tone } {
+  switch (state) {
+    case 'RECOVERED':
+      return { label: 'Payée', tone: 'success' };
+    case 'LOST':
+      return { label: 'Impayée, relances terminées', tone: 'danger' };
+    case 'CANCELED':
+      return { label: 'Annulée', tone: 'neutral' };
+    case 'CLOSED_MANUAL':
+      return { label: 'Clôturée à la main', tone: 'neutral' };
+    default:
+      return { label: 'Impayée', tone: 'warning' };
+  }
+}
+
+/** État d'envoi affiché aux fondateurs : dérivé du mode test ET de l'interrupteur « emails ». */
+export function sendMode(t: { dryRun: boolean; emailsEnabled: boolean }): { key: 'live' | 'test' | 'disabled'; label: string; tone: Tone; text: string } {
+  if (!t.emailsEnabled) {
+    return {
+      key: 'disabled',
+      label: 'Emails désactivés',
+      tone: 'danger',
+      text: 'Les emails de relance sont désactivés : aucun email ne part. Les relances dues pendant ce temps sont abandonnées, pas reportées. Réactivez-les dans les réglages.',
+    };
+  }
+  if (t.dryRun) return { key: 'test', label: 'Mode test', tone: 'warning', text: 'Mode test : RecoverKit enregistre ce qui serait envoyé, sans écrire à vos clients ni retenter de paiement.' };
+  return { key: 'live', label: 'Relances actives', tone: 'success', text: 'Relances actives : vos clients reçoivent les emails et les paiements sont retentés.' };
 }
 
 const FAILURES: Record<string, string> = {
@@ -80,7 +118,7 @@ export function failureLabel(code: string | null): string {
 
 /** Badge d'une ligne de dossier : met en avant le dernier avis imminent (48 h). */
 export function caseBadge(
-  c: { state: string; stepsSent: number; stepsTotal: number; nextDueAt: Date | null },
+  c: { state: string; stepsSent: number; stepsTotal: number; nextDueAt: Date | null; attribution?: Attribution },
   now: Date,
 ): { label: string; tone: Tone } {
   if (c.state === 'RECOVERING' && c.nextDueAt && c.stepsTotal > 0 && c.stepsSent === c.stepsTotal - 1) {
@@ -90,10 +128,10 @@ export function caseBadge(
       return { label: `Dernier avis ${when}`, tone: 'warning' };
     }
   }
-  return stateLabel(c.state);
+  return stateLabel(c.state, c.attribution);
 }
 
-export function actionLabel(action: string, d: Record<string, unknown>): string {
+export function actionLabel(action: string, d: Record<string, unknown>, attribution?: Attribution): string {
   const step = typeof d.stepIndex === 'number' ? d.stepIndex + 1 : null;
   switch (action) {
     case 'case.opened':
@@ -125,7 +163,9 @@ export function actionLabel(action: string, d: Record<string, unknown>): string 
     case 'retry.skipped_dry_run':
       return 'Nouvelle tentative ignorée (mode test)';
     case 'case.recovered':
-      return 'Paiement récupéré';
+      if (attribution === 'ASSISTED') return 'Paiement récupéré';
+      if (attribution === 'NATURAL') return 'Payé sans relance (non compté)';
+      return 'Facture payée (aucun revenu compté)';
     case 'case.canceled':
       return 'Dossier annulé';
     case 'case.lost':
@@ -139,7 +179,19 @@ export function actionLabel(action: string, d: Record<string, unknown>): string 
     case 'case.closed_manual':
       return `Dossier clôturé manuellement${d.reason ? ` : ${String(d.reason)}` : ''}`;
     case 'ledger.recorded':
-      return 'Revenu récupéré enregistré';
+      return d.attribution === 'NATURAL' ? 'Paiement enregistré, non compté dans le revenu récupéré' : 'Revenu récupéré enregistré';
+    case 'case.paid_after_close':
+      return `Facture payée après la clôture du dossier (${d.attribution === 'NATURAL' ? 'non comptée' : 'revenu récupéré enregistré'})`;
+    case 'email.deferred':
+      return `Email ${step ?? ''} repoussé : un autre email est parti il y a moins de 12 h`.replace('  ', ' ');
+    case 'email.retry_scheduled':
+      return `Email ${step ?? ''} : nouvel essai d’envoi planifié`.replace('  ', ' ');
+    case 'steps.rescheduled':
+      return 'Relances replanifiées après la reconnexion de Stripe';
+    case 'case.failure_ignored':
+      return 'Nouvel échec ignoré : le dossier est déjà clos';
+    case 'paid.ignored_stale':
+      return 'Paiement ignoré : la facture a changé depuis';
     case 'ledger.adjusted':
       return 'Revenu ajusté (remboursement ou litige)';
     default:

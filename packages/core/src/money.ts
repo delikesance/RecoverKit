@@ -1,3 +1,12 @@
+/** Devises que Stripe compte en centièmes alors que la norme ISO 4217 (donc Intl) leur donne 0 décimale. */
+const STRIPE_TWO_DECIMAL_EXCEPTIONS = new Set(['ISK', 'UGX']);
+
+/** Décimales des unités mineures telles que Stripe les renvoie (JPY=0, USD=2, KWD=3, ISK/UGX=2). */
+export function currencyDigits(currency: string): number {
+  if (STRIPE_TWO_DECIMAL_EXCEPTIONS.has(currency)) return 2;
+  return new Intl.NumberFormat('en', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2;
+}
+
 export class Money {
   private constructor(
     readonly amount: number,
@@ -38,8 +47,7 @@ export class Money {
 
   format(locale: string): string {
     const formatter = new Intl.NumberFormat(locale, { style: 'currency', currency: this.currency });
-    const digits = formatter.resolvedOptions().maximumFractionDigits ?? 2;
-    return formatter.format(this.amount / 10 ** digits);
+    return formatter.format(this.amount / 10 ** currencyDigits(this.currency));
   }
 
   private assertSameCurrency(other: Money): void {

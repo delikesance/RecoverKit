@@ -13,6 +13,7 @@ const emailSchema = z.string().email();
 
 export type ConfigureResult =
   | { status: 'pending'; domain: string; records: DnsRecord[] }
+  | { status: 'verified'; domain: string }
   | { status: 'invalid' }
   | { status: 'freemail' };
 
@@ -37,6 +38,7 @@ export async function configureSender(
   if (!current) throw new Error('Tenant introuvable');
 
   let domainId: string = current.sender_domain_id;
+  let oldDomainId: string | null = null;
   let verified: boolean | null = null;
   let records: DnsRecord[] = [];
   if (current.sender_domain === domain && domainId) {
@@ -44,7 +46,8 @@ export async function configureSender(
     records = d.records;
     verified = d.status === 'verified';
   } else {
-    if (domainId) await deps.domains.deleteDomain(domainId);
+    // L'ancien domaine n'est supprimé qu'après création du nouveau et enregistrement en base.
+    oldDomainId = domainId || null;
     const d = await deps.domains.createDomain(domain);
     domainId = d.id;
     records = d.records;
@@ -59,7 +62,23 @@ export async function configureSender(
     );
     await logAction(tx, { tenantId, caseId: null, actor: 'user', action: 'sender.configured', details: { domain } });
   });
+  if (oldDomainId) {
+    try {
+      await deps.domains.deleteDomain(oldDomainId);
+    } catch (e) {
+      deps.log.warn({ tenantId, err: (e as Error).message }, 'suppression de l’ancien domaine expéditeur impossible');
+    }
+  }
+  if (verified) {
+    await resolveSenderAlert(deps, tenantId);
+    return { status: 'verified', domain };
+  }
   return { status: 'pending', domain, records };
+}
+
+/** La condition de l'alerte a disparu (domaine vérifié ou expéditeur supprimé) : on la résout. */
+async function resolveSenderAlert(deps: Deps, tenantId: string): Promise<void> {
+  await deps.pool.query(`update system_alerts set resolved_at = $2 where tenant_id = $1 and kind = 'sender_domain_failed' and resolved_at is null`, [tenantId, deps.clock.now()]);
 }
 
 /** Interroge le fournisseur ; active l'expéditeur dès que le domaine est vérifié. */
@@ -74,6 +93,7 @@ export async function checkSenderDomain(deps: Deps, tenantId: string, opts: { tr
       await deps.pool.query(`update tenants set sender_verified = true where id = $1`, [tenantId]);
       await logAction(deps.pool, { tenantId, caseId: null, actor: 'system', action: 'sender.verified', details: { domain: d.name } });
     }
+    await resolveSenderAlert(deps, tenantId);
     return { status: 'verified' };
   }
   if (row.sender_verified) await deps.pool.query(`update tenants set sender_verified = false where id = $1`, [tenantId]);
@@ -96,5 +116,6 @@ export async function removeSender(deps: Deps, tenantId: string): Promise<void> 
     `update tenants set sender_email = null, sender_name = null, sender_domain = null, sender_domain_id = null, sender_verified = false where id = $1`,
     [tenantId],
   );
+  await resolveSenderAlert(deps, tenantId);
   await logAction(deps.pool, { tenantId, caseId: null, actor: 'user', action: 'sender.removed', details: {} });
 }

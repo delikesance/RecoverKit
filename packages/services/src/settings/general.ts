@@ -80,7 +80,10 @@ export async function confirmDefaultSender(deps: Deps, tenantId: string): Promis
   await deps.pool.query(`update tenants set onboarding = onboarding || '{"senderConfirmed": true}'::jsonb where id = $1`, [tenantId]);
 }
 
-export type ActivationMissing = 'stripe_connected' | 'sender_valid' | 'native_emails_acknowledged' | 'test_email_sent';
+/** Nom donné à la création du compte : il apparaît chez le client final, il doit être remplacé avant l'activation. */
+export const DEFAULT_TENANT_NAME = 'Mon entreprise';
+
+export type ActivationMissing = 'stripe_connected' | 'sender_valid' | 'native_emails_acknowledged' | 'test_email_sent' | 'company_name';
 
 export async function setDryRun(
   deps: Deps,
@@ -97,6 +100,7 @@ export async function setDryRun(
     if (tenant?.senderEmail && !tenant.senderVerified) missing.push('sender_valid');
     if (!ob.nativeEmailsAcknowledged) missing.push('native_emails_acknowledged');
     if (!ob.testEmailSentAt) missing.push('test_email_sent');
+    if (!tenant || tenant.name.trim().toLowerCase() === DEFAULT_TENANT_NAME.toLowerCase()) missing.push('company_name');
     if (missing.length > 0) return { status: 'blocked', missing };
   }
   await deps.pool.query(`update tenants set dry_run = $2 where id = $1`, [tenantId, dryRun]);

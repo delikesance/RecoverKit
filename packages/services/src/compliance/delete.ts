@@ -34,8 +34,24 @@ export async function deleteTenant(
     }
   }
 
+  const tenantRow = (await deps.pool.query(`select sender_domain_id from tenants where id = $1`, [tenantId])).rows[0];
+  if (tenantRow?.sender_domain_id) {
+    try {
+      await deps.domains.deleteDomain(tenantRow.sender_domain_id);
+    } catch (e) {
+      deps.log.warn({ tenantId, err: (e as Error).message }, "suppression du domaine d'envoi impossible pendant la suppression du compte");
+    }
+  }
+
   await withTransaction(deps.pool, async (tx) => {
     await lockTenant(tx, tenantId);
+    // payloads Stripe bruts (email/nom des clients finaux) et jetons de connexion du fondateur
+    await tx.query(
+      `delete from inbox_events where tenant_id = $1
+          or (stripe_account_id is not null and stripe_account_id in (select stripe_account_id from stripe_connections where tenant_id = $1))`,
+      [tenantId],
+    );
+    await tx.query(`delete from login_tokens where lower(email) in (select lower(email) from users where tenant_id = $1)`, [tenantId]);
     await tx.query(`set local recoverkit.allow_purge = 'on'`);
     await tx.query(`delete from action_log where tenant_id = $1`, [tenantId]);
     await tx.query(`delete from tenants where id = $1`, [tenantId]);

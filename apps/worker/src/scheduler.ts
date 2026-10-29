@@ -43,10 +43,9 @@ export class Scheduler {
     return { runs: s.runs, failures: s.failures };
   }
 
-  /** Lance les tâches échues et attend la fin de celles qu'elle vient de démarrer. */
+  /** Lance les tâches échues sans les attendre (le garde `running` évite le chevauchement) : une tâche lente ne gèle pas les autres. */
   async tick(): Promise<void> {
     const now = this.clock.now().getTime();
-    const started: Promise<void>[] = [];
     for (const s of this.states.values()) {
       if (s.running || now < s.nextAt || this.stopped) continue;
       s.nextAt = now + s.task.everyMs;
@@ -61,9 +60,7 @@ export class Scheduler {
           s.running = null;
         }
       })();
-      started.push(s.running);
     }
-    await Promise.all(started);
   }
 
   start(pollMs = 1000): void {

@@ -34,7 +34,9 @@ export interface DashboardData {
   savedCustomers: number;
   previousRecovered: number;
   variation: number | null;
+  /** À date (état courant des dossiers actifs), indépendant du mois affiché. */
   atRisk: { amount: number; count: number };
+  atRiskAsOf: Date;
   rate: { byCount: number | null; byAmount: number | null; recovered: number; lost: number };
   series: { date: string; cumulative: number }[];
   recent: {
@@ -110,12 +112,23 @@ export async function getDashboard(
         )
       ).rows[0]
     : { n: 0, amount: 0 };
-  const rate = recoveryRate({
+  // Numérateur du taux par montant : seuls les RECOVERY ASSISTED du mois, sans ajustements (remboursements d'autres mois).
+  const recoveredGross = entries
+    .filter((e) => e.amount.currency === currency && e.attribution === 'ASSISTED' && e.kind === 'RECOVERY' && e.occurredAt >= cur.start && e.occurredAt < cur.end)
+    .reduce((sum, e) => sum + e.amount.amount, 0);
+  const rawRate = recoveryRate({
     recovered: s?.savedCustomers ?? 0,
     lost: lost.n,
-    recoveredAmount: recovered,
+    recoveredAmount: recoveredGross,
     lostAmount: Number(lost.amount),
   });
+  const rate = {
+    byCount: rawRate.byCount,
+    byAmount:
+      rawRate.byAmount === null || recovered < 0 || recoveredGross + Number(lost.amount) <= 0
+        ? null
+        : Math.min(Math.max(rawRate.byAmount, 0), 1),
+  };
 
   // Série cumulée par jour local (ASSISTED uniquement), jusqu'à aujourd'hui pour le mois en cours.
   const series: DashboardData['series'] = [];
@@ -146,7 +159,7 @@ export async function getDashboard(
         await deps.pool.query(
           `select l.case_id, l.amount, l.currency, l.attribution, l.occurred_at, e.name as customer_name,
                   (select count(*)::int from email_messages m
-                    where m.case_id = l.case_id and m.dry_run = false and m.sent_at < l.occurred_at) as emails
+                    where m.case_id = l.case_id and m.dry_run = false and m.status in ('SENT','DELIVERED') and m.sent_at < l.occurred_at) as emails
              from recovery_ledger l
              join recovery_cases c on c.id = l.case_id
              left join end_customers e on e.id = c.end_customer_id
@@ -168,6 +181,7 @@ export async function getDashboard(
     previousRecovered,
     variation: previousRecovered > 0 ? (recovered - previousRecovered) / previousRecovered : null,
     atRisk: { amount: Number(riskRow?.amount ?? 0), count: riskRow?.n ?? 0 },
+    atRiskAsOf: deps.clock.now(),
     rate: { ...rate, recovered: s?.savedCustomers ?? 0, lost: lost.n },
     series,
     recent: recentRows.map((r) => ({
@@ -307,6 +321,8 @@ export interface CaseDetail {
   emails: { stepIndex: number; subject: string; sentAt: Date; status: string; opened: boolean; clicked: boolean; dryRun: boolean }[];
   attempts: { paymentMethodId: string; status: string; errorCode: string | null; source: string; createdAt: Date }[];
   timeline: { action: string; actor: string; details: Record<string, unknown>; at: Date }[];
+  /** Attribution du ledger : distingue « récupéré » (ASSISTED) de « payé sans relance » (NATURAL) ; null si aucune écriture. */
+  attribution: 'ASSISTED' | 'NATURAL' | null;
   stripeInvoiceUrl: string;
 }
 
@@ -314,12 +330,13 @@ export async function getCaseDetail(deps: Deps, tenantId: string, caseId: string
   const c = await deps.pool.query(`select * from recovery_cases where id = $1 and tenant_id = $2`, [caseId, tenantId]);
   if (!c.rows[0]) return null;
   const row = mapCase(c.rows[0]);
-  const [cust, steps, emails, attempts, logs] = await Promise.all([
+  const [cust, steps, emails, attempts, logs, ledgerRow] = await Promise.all([
     deps.pool.query(`select name, email, locale from end_customers where id = $1`, [row.endCustomerId]),
     deps.pool.query(`select step_index, status, due_at, sent_at, skip_reason from scheduled_steps where case_id = $1 order by step_index`, [caseId]),
     deps.pool.query(`select step_index, subject, sent_at, status, opened_at, clicked_at, dry_run from email_messages where case_id = $1 order by sent_at`, [caseId]),
     deps.pool.query(`select payment_method_id, status, error_code, source, created_at from payment_attempts where case_id = $1 order by created_at`, [caseId]),
     deps.pool.query(`select action, actor, details, created_at from action_log where tenant_id = $1 and case_id = $2 order by id`, [tenantId, caseId]),
+    deps.pool.query(`select attribution from recovery_ledger where tenant_id = $1 and case_id = $2 and kind = 'RECOVERY' order by occurred_at, id limit 1`, [tenantId, caseId]),
   ]);
   return {
     case: row,
@@ -328,6 +345,7 @@ export async function getCaseDetail(deps: Deps, tenantId: string, caseId: string
     emails: emails.rows.map((m) => ({ stepIndex: m.step_index, subject: m.subject, sentAt: m.sent_at, status: m.status, opened: m.opened_at !== null, clicked: m.clicked_at !== null, dryRun: m.dry_run })),
     attempts: attempts.rows.map((a) => ({ paymentMethodId: a.payment_method_id, status: a.status, errorCode: a.error_code, source: a.source, createdAt: a.created_at })),
     timeline: logs.rows.map((l) => ({ action: l.action, actor: l.actor, details: l.details, at: l.created_at })),
+    attribution: ledgerRow.rows[0]?.attribution ?? null,
     stripeInvoiceUrl: stripeInvoiceUrl(row.stripeInvoiceId),
   };
 }
@@ -342,6 +360,7 @@ export interface BannerAlert {
 
 export const ALERT_SEVERITY: Record<string, AlertSeverity> = {
   stripe_revoked: 'critical',
+  emails_disabled: 'warning',
   webhook_dead: 'critical',
   billing_past_due: 'critical',
   email_failed: 'warning',
@@ -351,9 +370,31 @@ export const ALERT_SEVERITY: Record<string, AlertSeverity> = {
   email_bounced: 'info',
 };
 
+/** Résout les alertes dont la condition a disparu : email client renseigné, envoi réussi pour l'étape. */
+async function resolveStaleAlerts(deps: Deps, tenantId: string): Promise<void> {
+  const now = deps.clock.now();
+  await deps.pool.query(
+    `update system_alerts a set resolved_at = $2
+      where a.tenant_id = $1 and a.resolved_at is null and a.kind = 'customer_email_missing'
+        and exists (select 1 from recovery_cases c join end_customers e on e.id = c.end_customer_id
+                     where c.tenant_id = a.tenant_id and c.stripe_invoice_id = split_part(a.dedupe_key, ':', 3) and coalesce(e.email, '') <> '')`,
+    [tenantId, now],
+  );
+  await deps.pool.query(
+    `update system_alerts a set resolved_at = $2
+      where a.tenant_id = $1 and a.resolved_at is null and a.kind = 'email_failed'
+        and exists (select 1 from email_messages m
+                     where m.tenant_id = a.tenant_id and m.case_id::text = split_part(a.dedupe_key, ':', 2)
+                       and m.step_index::text = split_part(a.dedupe_key, ':', 3)
+                       and m.dry_run = false and m.status in ('SENT','DELIVERED'))`,
+    [tenantId, now],
+  );
+}
+
 export async function getBannerAlerts(deps: Deps, tenantId: string): Promise<BannerAlert[]> {
   const tenant = await loadTenant(deps.pool, tenantId);
   if (!tenant) return [];
+  await resolveStaleAlerts(deps, tenantId);
   const out: BannerAlert[] = [];
 
   const conn = await deps.pool.query(`select status from stripe_connections where tenant_id = $1`, [tenantId]);
@@ -389,7 +430,18 @@ export async function getBannerAlerts(deps: Deps, tenantId: string): Promise<Ban
     out.push({ kind: 'last_notice', severity: 'warning', message: `${last.rows.length} clients reçoivent leur dernier avis dans les 48 prochaines heures.`, href: '/app/cases' });
   }
 
+  if (!tenant.emailsEnabled) {
+    out.push({
+      kind: 'emails_disabled',
+      severity: 'warning',
+      message: 'Les emails de relance sont désactivés : les relances dues pendant ce temps sont abandonnées, pas reportées.',
+      href: '/app/settings',
+    });
+  }
+
   const present = new Set(out.map((a) => a.kind));
+  // Une connexion Stripe active invalide toute ancienne alerte de révocation encore ouverte.
+  if (conn.rows[0]?.status === 'ACTIVE') present.add('stripe_revoked');
   const alerts = await deps.pool.query(`select kind, message from system_alerts where tenant_id = $1 and resolved_at is null order by created_at`, [tenantId]);
   for (const a of alerts.rows) {
     if (present.has(a.kind)) continue;

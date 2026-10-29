@@ -38,7 +38,7 @@ export function AppShell({
           <span className="brand-mark"><LogoMark /></span>
           RecoverKit
         </div>
-        <nav aria-label="Principal" className="stack" style={{ gap: 4 }}>
+        <nav aria-label="Principal" className="stack app-nav" style={{ gap: 4 }}>
           {NAV.map((n) => (
             <a key={n.key} href={n.href} className="nav-link" aria-current={n.key === active ? 'page' : undefined}>
               {n.icon}
@@ -50,7 +50,7 @@ export function AppShell({
         <div style={{ flex: 1 }} />
         <div className="status-box">
           <b><span className={stripeOk ? 'dot' : 'dot dot-bad'} />{stripeLabel}</b>
-          {stripeOk ? 'Les paiements échoués sont détectés automatiquement.' : 'Connectez Stripe pour activer les relances.'}
+          <span className="status-hint">{stripeOk ? 'Les paiements échoués sont détectés automatiquement.' : 'Connectez Stripe pour activer les relances.'}</span>
         </div>
         <div className="row tenant" style={{ gap: 10, padding: '14px 8px 0' }}>
           <span className="av" style={{ background: 'var(--blue-tint)', color: 'var(--blue-hover)' }}>{tenantName.slice(0, 1).toUpperCase()}</span>

@@ -3,10 +3,19 @@
 
 FROM node:22-bookworm-slim AS build
 WORKDIR /app
+# Manifestes d'abord : la couche « npm ci » n'est refaite que si les dépendances changent.
 COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/core/package.json ./packages/core/
+COPY packages/db/package.json ./packages/db/
+COPY packages/mail/package.json ./packages/mail/
+COPY packages/services/package.json ./packages/services/
+COPY packages/stripe/package.json ./packages/stripe/
+COPY packages/testkit/package.json ./packages/testkit/
+COPY apps/web/package.json ./apps/web/
+COPY apps/worker/package.json ./apps/worker/
+RUN --mount=type=cache,target=/root/.npm npm ci
 COPY packages ./packages
 COPY apps ./apps
-RUN npm ci
 # Aucune variable d'environnement n'est nécessaire au build : la configuration est lue au démarrage.
 RUN npm run build --workspace @recoverkit/web
 

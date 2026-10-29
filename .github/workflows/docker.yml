@@ -1,15 +1,19 @@
 name: Image Docker
 
+# Sur les PR : construction + test de fumée seulement.
+# Publication (ghcr) : uniquement après un run « CI » réussi sur main ou sur un tag v*.
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
 
 concurrency:
-  group: docker-${{ github.ref }}
-  cancel-in-progress: true
+  # La branche / le tag fait partie du groupe : le run main et le run tag d'un même commit
+  # (même head_sha) ne s'annulent pas. Jamais d'annulation d'une publication en cours.
+  group: docker-${{ github.event.workflow_run.head_sha || github.sha }}-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -17,27 +21,44 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
   image:
     runs-on: ubuntu-latest
+    # Un run workflow_run n'est utile que si la CI est verte et qu'elle portait sur un push.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' &&
+       (github.event.workflow_run.head_branch == 'main' || startsWith(github.event.workflow_run.head_branch, 'v')))
+    env:
+      PUBLISH_BRANCH: ${{ github.event.workflow_run.head_branch }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Nom d'image en minuscules
-        run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
-
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+      # Étiquettes calculées ici : metadata-action ne voit pas le ref d'origine dans un run workflow_run.
+      - id: publish
+        name: Décider de la publication et des étiquettes
+        run: |
+          image="${IMAGE,,}"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          publish=false
+          tags=""
+          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
+            tags="$image:sha-${SOURCE_SHA::7}"
+            if [ "$PUBLISH_BRANCH" = main ]; then
+              publish=true
+            elif [[ "$PUBLISH_BRANCH" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              publish=true
+              tags="$tags,$image:${PUBLISH_BRANCH#v},$image:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            fi
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
       # Construction locale, utilisée pour le test de fumée avant toute publication.
       - name: Construire l'image
@@ -52,8 +73,27 @@ jobs:
       - name: Test de fumée (port unique, base intégrée, persistance)
         run: scripts/docker-smoke.sh recoverkit:smoke
 
+      # latest seulement si le SHA source est encore le tip de main (deux CI main peuvent finir
+      # dans le désordre). Au moindre doute (échec de ls-remote), on ne tague pas latest.
+      - id: final
+        name: Décider de l'étiquette latest
+        if: steps.publish.outputs.publish == 'true'
+        env:
+          TAGS: ${{ steps.publish.outputs.tags }}
+        run: |
+          tags="$TAGS"
+          if [ "$PUBLISH_BRANCH" = main ]; then
+            tip=$(git ls-remote origin refs/heads/main | cut -f1 || true)
+            if [ -n "$tip" ] && [ "$tip" = "$SOURCE_SHA" ]; then
+              tags="$tags,$IMAGE:latest"
+            else
+              echo "::notice::$SOURCE_SHA n'est plus le tip de main (${tip:-inconnu}) : pas de tag latest."
+            fi
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
       - name: Connexion à ghcr.io
-        if: github.event_name != 'pull_request'
+        if: steps.publish.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -61,12 +101,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publier l'image
-        if: github.event_name != 'pull_request'
+        if: steps.publish.outputs.publish == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.final.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
           cache-from: type=gha

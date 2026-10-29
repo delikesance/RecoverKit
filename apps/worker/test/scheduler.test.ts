@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { FakeClock } from '@recoverkit/core';
 import { Scheduler } from '../src/scheduler';
 
@@ -49,26 +49,46 @@ describe('Scheduler', () => {
     const gate = new Promise<void>((r) => (release = r));
     const s = new Scheduler(clock, silent as any);
     s.add({ name: 'longue', everyMs: 1_000, run: async () => { running++; max = Math.max(max, running); await gate; running--; } });
-    const first = s.tick();
+    await s.tick();
     clock.advance({ seconds: 5 });
     await s.tick(); // la première n'est pas finie : on saute
     expect(max).toBe(1);
     release();
-    await first;
+    await s.stop();
     expect(s.stats('longue').runs).toBe(1);
   });
 
-  it('start/stop : boucle de tick et arrêt propre en attendant les tâches en cours', async () => {
+  it('une tâche lente ne gèle pas les autres : tick() ne l’attend pas', async () => {
     const clock = new FakeClock(new Date('2026-10-28T10:00:00Z'));
-    let done = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let fast = 0;
     const s = new Scheduler(clock, silent as any);
-    s.add({ name: 't', everyMs: 1, run: async () => { await new Promise((r) => setTimeout(r, 20)); done = true; } });
-    s.start(5);
-    await new Promise((r) => setTimeout(r, 15));
+    s.add({ name: 'lente', everyMs: 60_000, run: () => gate });
+    s.add({ name: 'rapide', everyMs: 1_000, run: async () => void fast++ });
+    const timeout = new Promise<string>((r) => setTimeout(() => r('bloqué'), 500));
+    expect(await Promise.race([s.tick().then(() => 'rendu'), timeout])).toBe('rendu');
+    clock.advance({ seconds: 2 });
+    await s.tick();
+    expect(fast).toBe(2); // la tâche rapide a continué pendant que la lente tourne
+    expect(s.stats('lente').runs).toBe(0);
+    release();
     await s.stop();
-    expect(done).toBe(true);
+    expect(s.stats('lente').runs).toBe(1);
+  });
+
+  it('start/stop : vraie boucle courte, plusieurs exécutions puis plus aucune après l’arrêt', async () => {
+    const real = { now: () => new Date() };
+    let calls = 0;
+    let finished = 0;
+    const s = new Scheduler(real, silent as any);
+    s.add({ name: 't', everyMs: 5, run: async () => { calls++; await new Promise((r) => setTimeout(r, 10)); finished++; } });
+    s.start(2);
+    await vi.waitFor(() => expect(s.stats('t').runs).toBeGreaterThanOrEqual(3), { timeout: 2000, interval: 5 });
+    await s.stop();
+    expect(finished).toBe(calls); // stop() a attendu la tâche en cours
     const runs = s.stats('t').runs;
-    await new Promise((r) => setTimeout(r, 30));
+    await new Promise((r) => setTimeout(r, 60));
     expect(s.stats('t').runs).toBe(runs); // plus aucune exécution après l'arrêt
   });
 

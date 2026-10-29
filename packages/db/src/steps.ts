@@ -62,6 +62,8 @@ export async function reserveDueSteps(
     opts.tenantId ? [now, opts.tenantId] : [now],
   );
 
+  // Une seule étape par dossier à la fois : la plus petite step_index encore planifiée, et aucune tant qu'une
+  // autre étape du dossier est en cours d'envoi (jamais de rafale, même après une panne du worker).
   // Tourniquet entre tenants : on classe les étapes échues par rang au sein de chaque tenant, puis on
   // verrouille (SKIP LOCKED) dans un vivier 4 fois plus large pour que les workers concurrents ne se bloquent pas.
   const res = await db.query(
@@ -73,11 +75,14 @@ export async function reserveDueSteps(
          join tenants t on t.id = s.tenant_id
         where s.status = 'SCHEDULED' and s.due_at <= $1 and c.state = 'RECOVERING'
           and t.emails_enabled = true and t.status = 'ACTIVE' ${tenantFilter}
+          and s.step_index = (select min(m.step_index) from scheduled_steps m where m.case_id = s.case_id and m.status = 'SCHEDULED')
+          and not exists (select 1 from scheduled_steps b where b.case_id = s.case_id and b.status = 'SENDING')
      ), pool as (
        select id, rn, due_at from ranked order by rn, due_at limit $2 * 4
      ), picked as (
        select s.id from scheduled_steps s join pool p on p.id = s.id
         where s.status = 'SCHEDULED'
+          and not exists (select 1 from scheduled_steps b where b.case_id = s.case_id and b.status = 'SENDING')
         order by p.rn, p.due_at, s.id
         limit $2
         for update of s skip locked
@@ -90,13 +95,19 @@ export async function reserveDueSteps(
   return res.rows.map(mapStep);
 }
 
-/** Remet en file les réservations abandonnées (worker mort entre la réservation et l'envoi). */
-export async function recoverStaleReservations(db: Queryable, now: Date, staleMs: number): Promise<StepRow[]> {
+/**
+ * Remet en file les réservations abandonnées (worker mort entre la réservation et l'envoi).
+ * Avec `maxAttempts`, une étape qui a déjà atteint le plafond passe FAILED(send_failed) au lieu d'être rejouée sans fin.
+ */
+export async function recoverStaleReservations(db: Queryable, now: Date, staleMs: number, maxAttempts?: number): Promise<StepRow[]> {
   const res = await db.query(
-    `update scheduled_steps set status = 'SCHEDULED', reserved_at = null
+    `update scheduled_steps
+        set status = case when $2::int is not null and attempts >= $2::int then 'FAILED' else 'SCHEDULED' end,
+            skip_reason = case when $2::int is not null and attempts >= $2::int then 'send_failed' else skip_reason end,
+            reserved_at = null
       where status = 'SENDING' and reserved_at < $1
       returning *`,
-    [new Date(now.getTime() - staleMs)],
+    [new Date(now.getTime() - staleMs), maxAttempts ?? null],
   );
   return res.rows.map(mapStep);
 }

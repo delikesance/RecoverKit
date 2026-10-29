@@ -19,5 +19,8 @@ export async function handleResendWebhook(deps: Deps, req: Request): Promise<Res
     rawBody,
     headers: { id: req.headers.get('svix-id'), timestamp: req.headers.get('svix-timestamp'), signature: req.headers.get('svix-signature') },
   });
-  return r.status === 'rejected' ? jsonResponse({ error: 'rejected' }, 400) : jsonResponse({ received: true }, 200);
+  if (r.status === 'rejected') return jsonResponse({ error: 'rejected' }, 400);
+  // Évènement arrivé avant l'enregistrement de l'email : 503 pour que Resend réessaie (svix-id non consommé).
+  if (r.status === 'retry') return jsonResponse({ error: 'retry' }, 503, { 'retry-after': '60' });
+  return jsonResponse({ received: true }, 200);
 }

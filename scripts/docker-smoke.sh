@@ -51,6 +51,11 @@ migrations="$(docker exec "$NAME" psql -h /tmp -U postgres -d recoverkit -Atc 's
 psql_in() { docker exec "$NAME" psql -h /tmp -U postgres -d recoverkit -Atc "$1"; }
 psql_in 'create table smoke_marker as select 42 as v' >/dev/null
 
+# 2 bis. APP_URL est lu au démarrage, pas figé au build : le sitemap doit porter l'URL passée à docker run.
+sitemap="$(curl -s "http://127.0.0.1:$HOST_PORT/sitemap.xml")"
+grep -q 'https://app.example.test/' <<<"$sitemap" || fail "sitemap.xml n'utilise pas APP_URL : $sitemap"
+! grep -q 'localhost' <<<"$sitemap" || fail "sitemap.xml contient localhost"
+
 # 3. Hors loopback, seul le port 3000 (0x0BB8) écoute.
 external="$(docker exec "$NAME" bash -c "awk 'NR>1 && \$4==\"0A\" {print \$2}' /proc/net/tcp /proc/net/tcp6" \
   | grep -v -E '^(0100007F|0000000000000000FFFF00000100007F|00000000000000000000000001000000):' | sort -u || true)"
@@ -64,6 +69,8 @@ exit_code="$(docker inspect -f '{{.State.ExitCode}}' "$NAME")"
 docker rm "$NAME" >/dev/null
 run
 wait_healthy
-docker logs "$NAME" 2>&1 | grep -q 'base déjà initialisée' || fail "le volume n'a pas été réutilisé"
+# Les journaux sont capturés avant de chercher : « docker logs | grep -q » sous pipefail peut renvoyer 141 (SIGPIPE).
+logs="$(docker logs "$NAME" 2>&1)"
+grep -q 'base déjà initialisée' <<<"$logs" || fail "le volume n'a pas été réutilisé"
 [ "$(psql_in 'select v from smoke_marker')" = 42 ] || fail "les données n'ont pas survécu au redémarrage"
 echo "OK : image saine (port unique 3000, base intégrée, persistance et redémarrage)"

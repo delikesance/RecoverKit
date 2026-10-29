@@ -6,7 +6,9 @@ import { AppShell } from '@/ui/AppShell';
 import { AreaChart } from '@/ui/AreaChart';
 import { Banners } from '@/ui/Banners';
 import { CasesTable } from '@/ui/CasesTable';
-import { formatMoney, formatPercent, formatShortDate, formatVariation, monthLabel } from '@/lib/format';
+import { formatMoney, formatPercent, formatShortDate, monthLabel, sendMode } from '@/lib/format';
+import { normalizeCurrency } from '@/lib/amount';
+import { parsePeriod, variationNote } from '@/lib/period';
 
 export const metadata: Metadata = { title: 'Tableau de bord' };
 export const dynamic = 'force-dynamic';
@@ -20,29 +22,30 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
   const sp = await searchParams;
   const ctx = await loadAppContext();
   const nowLocal = partsInZone(ctx.now, ctx.tenant.timeZone);
-  const year = Number(sp.year) >= 2000 ? Number(sp.year) : nowLocal.y;
-  const month = Number(sp.month) >= 1 && Number(sp.month) <= 12 ? Number(sp.month) : nowLocal.m;
-  const data = await getDashboard(ctx.deps, ctx.tenant.id, { year, month, currency: sp.currency });
+  const { year, month } = parsePeriod(sp, nowLocal);
+  const wantedCurrency = normalizeCurrency(sp.currency);
+  const data = await getDashboard(ctx.deps, ctx.tenant.id, { year, month, currency: wantedCurrency });
   const cases = await listCases(ctx.deps, ctx.tenant.id, { pageSize: 5 });
   const currency = data.currency ?? 'EUR';
   const prev = shiftMonth(year, month, -1);
   const next = shiftMonth(year, month, 1);
   const isCurrent = year === nowLocal.y && month === nowLocal.m;
-  const variation = formatVariation(data.variation);
-  const csvHref = `/api/app/export/recovered?year=${year}&month=${month}`;
+  const cur = wantedCurrency ? `&currency=${encodeURIComponent(currency)}` : '';
+  const csvHref = `/api/app/export/recovered?year=${year}&month=${month}${cur}`;
+  const mode = sendMode(ctx.tenant);
 
   return (
     <AppShell tenantName={ctx.tenant.name} active="dashboard" activeCases={ctx.activeCases} stripe={ctx.stripe} userEmail={ctx.session.email}>
       <div className="row wrap" style={{ gap: 16, justifyContent: 'space-between' }}>
         <div>
           <h1 className="page-title">Tableau de bord</h1>
-          <p className="page-sub">{monthLabel(year, month)}{ctx.tenant.dryRun ? ' · mode test : aucun email n’est envoyé' : ''}</p>
+          <p className="page-sub">{monthLabel(year, month)}{mode.key === 'test' ? ' · mode test : aucun email n’est envoyé' : mode.key === 'disabled' ? ' · emails désactivés : aucun email n’est envoyé' : ''}</p>
         </div>
         <div className="row wrap" style={{ gap: 12 }}>
           <nav aria-label="Période" className="row" style={{ gap: 8 }}>
-            <a className="btn btn-s" href={`/app?year=${prev.year}&month=${prev.month}`} aria-label={`Mois précédent : ${monthLabel(prev.year, prev.month)}`}>←</a>
+            <a className="btn btn-s" href={`/app?year=${prev.year}&month=${prev.month}${cur}`} aria-label={`Mois précédent : ${monthLabel(prev.year, prev.month)}`}>←</a>
             <span className="btn btn-s" aria-current="date" style={{ pointerEvents: 'none' }}>{monthLabel(year, month)}</span>
-            {isCurrent ? <span className="btn btn-s" aria-disabled="true" style={{ opacity: 0.5, pointerEvents: 'none' }}>→</span> : <a className="btn btn-s" href={`/app?year=${next.year}&month=${next.month}`} aria-label={`Mois suivant : ${monthLabel(next.year, next.month)}`}>→</a>}
+            {isCurrent ? <span className="btn btn-s" aria-disabled="true" style={{ opacity: 0.5, pointerEvents: 'none' }}>→</span> : <a className="btn btn-s" href={`/app?year=${next.year}&month=${next.month}${cur}`} aria-label={`Mois suivant : ${monthLabel(next.year, next.month)}`}>→</a>}
           </nav>
           <a className="btn btn-s" href={csvHref}>Exporter en CSV</a>
         </div>
@@ -63,7 +66,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
         <div className="panel kpi">
           <div className="kpi-label">Revenu récupéré</div>
           <div className="kpi-value num" style={{ color: 'var(--green)' }}>{formatMoney(data.recovered, currency)}</div>
-          <div className="kpi-note">{variation ? `${variation} par rapport au mois précédent` : 'Pas de mois précédent à comparer'}</div>
+          <div className="kpi-note">{variationNote(data.variation, isCurrent)}</div>
         </div>
         <div className="panel kpi">
           <div className="kpi-label">Clients sauvés</div>
@@ -76,9 +79,9 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
           <div className="kpi-note">en nombre de clients</div>
         </div>
         <div className="panel kpi">
-          <div className="kpi-label">En cours de relance</div>
+          <div className="kpi-label">En cours de relance (aujourd’hui)</div>
           <div className="kpi-value num" style={{ color: 'var(--amber-ink)' }}>{formatMoney(data.atRisk.amount, currency)}</div>
-          <div className="kpi-note">sur {data.atRisk.count} paiement{data.atRisk.count > 1 ? 's' : ''}</div>
+          <div className="kpi-note">sur {data.atRisk.count} paiement{data.atRisk.count > 1 ? 's' : ''}, au {formatShortDate(data.atRiskAsOf, ctx.tenant.timeZone)} (indépendant du mois affiché)</div>
         </div>
       </section>
 

@@ -55,4 +55,15 @@ describe('FakeMailer', () => {
     await m.send(email({ idempotencyKey: 'b:0', to: 'autre@example.com' }));
     expect(m.messagesTo('autre@example.com')).toHaveLength(1);
   });
+
+  it('compte chaque appel à send par clé, y compris les rejeux dédoublonnés et les échecs', async () => {
+    const m = new FakeMailer();
+    await m.send(email());
+    await m.send(email());
+    m.failNext(new MailerError('timeout', { permanent: false }));
+    await expect(m.send(email())).rejects.toBeDefined();
+    expect(m.sent).toHaveLength(1);
+    expect(m.callCount('case1:0')).toBe(3);
+    expect(m.callCount('inconnue')).toBe(0);
+  });
 });

@@ -56,6 +56,10 @@ export async function completeOnboarding(page: Page, request: APIRequestContext,
   await expect(page.locator('.chip', { hasText: 'Stripe connecté' })).toBeVisible();
   await page.getByRole('button', { name: 'Garder l’expéditeur par défaut' }).click();
   await page.getByRole('button', { name: 'C’est fait dans Stripe' }).click();
+  // Le nom par défaut « Mon entreprise » bloque l'activation : il faut le remplacer.
+  await page.getByLabel('Nom affiché à vos clients').fill(`Société ${account}`);
+  await page.getByRole('button', { name: 'Enregistrer le nom' }).click();
+  await expect(page.getByLabel('Nom affiché à vos clients')).toHaveValue(`Société ${account}`);
   await page.getByRole('button', { name: 'M’envoyer un email de test' }).click();
   await page.getByRole('button', { name: 'Activer les relances' }).click();
   await expect(page.getByRole('link', { name: 'Aller au tableau de bord' })).toBeVisible();

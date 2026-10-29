@@ -32,6 +32,9 @@ export async function runPreFinalRetries(deps: Deps): Promise<{ attempted: numbe
       if (!tenant || tenant.dryRun || conn.rows[0]?.status !== 'ACTIVE' || !c.stripeCustomerId) return false;
       const customer = await deps.stripe.retrieveCustomer(conn.rows[0].stripe_account_id, c.stripeCustomerId);
       if (!customer.defaultPaymentMethodId) return false;
+      // Relecture sous verrou : le dossier a pu être clôturé ou mis en pause depuis la sélection.
+      const fresh = await tx.query(`select state from recovery_cases where id = $1`, [c.id]);
+      if (fresh.rows[0]?.state !== 'RECOVERING') return false;
       const outcome = await attemptPayment(deps, tx, tenant, conn.rows[0].stripe_account_id, c, customer.defaultPaymentMethodId, 'webhook');
       if (outcome === 'already_attempted' || outcome === 'skipped_dry_run') return false;
       await logAction(tx, { tenantId: c.tenantId, caseId: c.id, actor: 'system', action: 'retry.pre_final', details: { outcome } });
